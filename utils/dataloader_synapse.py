@@ -23,8 +23,21 @@ different `root` subfolders) — everything else stays the same.
 9 segmentation classes (standard Synapse ordering):
     0 background, 1 aorta, 2 gallbladder, 3 kidney(L), 4 kidney(R),
     5 liver, 6 pancreas, 7 spleen, 8 stomach
+
+Train/val split
+----------------
+`train_npz` only ships one pool of 2D slices — there's no separate val
+folder the way ACDC's `prepare_acdc.py` produces train/val/test folders.
+To still get a per-epoch validation signal (val loss, val IoU, per-class
+Dice) without leaking, this module splits the *cases* (patients) found in
+`train_npz` into a train subset and a val subset, deterministically, based
+on `seed`/`val_fraction`. All slices from a given case always land in the
+same subset, so validation slices never share a patient with a training
+slice. `test_vol_h5` is untouched and stays the fully held-out test set.
 """
 
+import random
+import re
 from pathlib import Path
 
 import albumentations as A
@@ -43,6 +56,28 @@ CLASS_NAMES = [
     "liver", "pancreas", "spleen", "stomach",
 ]
 
+# Matches e.g. "case0005" out of "case0005_slice012.npz". Falls back to the
+# whole stem if a file doesn't follow the usual naming convention, so a
+# funny-named file just becomes its own single-slice "case" rather than
+# crashing the split.
+_CASE_ID_PATTERN = re.compile(r"(case\d+)", re.IGNORECASE)
+
+
+def _case_id_from_path(path):
+    m = _CASE_ID_PATTERN.search(path.stem)
+    return m.group(1).lower() if m else path.stem
+
+
+def _split_case_ids(case_ids, val_fraction=0.15, seed=42):
+    """Deterministically split a set of case ids into (train_ids, val_ids)."""
+    case_ids = sorted(case_ids)  # sort first so the shuffle is reproducible
+    rng = random.Random(seed)
+    rng.shuffle(case_ids)
+    n_val = max(1, int(round(len(case_ids) * val_fraction))) if len(case_ids) > 1 else 0
+    val_ids = set(case_ids[:n_val])
+    train_ids = set(case_ids[n_val:])
+    return train_ids, val_ids
+
 
 def _normalize(image):
     """Standard Synapse preprocessing already maps images to ~[0,1].
@@ -52,13 +87,37 @@ def _normalize(image):
 
 
 class SynapseTrainDataset(Dataset):
-    """2D slices for training, mirroring ACDCSliceDataset."""
+    """2D slices, mirroring ACDCSliceDataset, with a `split` argument
+    ("train" / "val" / "all") that partitions by case id."""
 
-    def __init__(self, root, img_size=224, augmentation=False):
+    def __init__(self, root, img_size=224, augmentation=False,
+                 split="train", val_fraction=0.15, seed=42):
         self.dir = Path(root) / TRAIN_DIR_NAME
-        self.files = sorted(self.dir.glob("*.npz"))
-        if not self.files:
+        all_files = sorted(self.dir.glob("*.npz"))
+        if not all_files:
             raise RuntimeError(f"No NPZ slices found in {self.dir}")
+
+        case_ids = sorted({_case_id_from_path(p) for p in all_files})
+        train_ids, val_ids = _split_case_ids(case_ids, val_fraction=val_fraction, seed=seed)
+
+        if split == "train":
+            keep_ids = train_ids
+        elif split == "val":
+            keep_ids = val_ids
+        elif split == "all":
+            keep_ids = train_ids | val_ids
+        else:
+            raise ValueError(f"Unknown split {split!r}; expected 'train', 'val', or 'all'.")
+
+        self.files = [p for p in all_files if _case_id_from_path(p) in keep_ids]
+        if not self.files:
+            raise RuntimeError(
+                f"No NPZ slices found for split={split!r} in {self.dir} "
+                f"(found {len(case_ids)} case(s) total, val_fraction={val_fraction}). "
+                "Try a larger val_fraction if you only have a handful of cases."
+            )
+        self.split = split
+        self.case_ids = keep_ids
         self.img_size = int(img_size)
 
         transforms = []
@@ -136,8 +195,14 @@ def _train_collate(batch):
 
 
 def get_synapse_train_loader(root, batch_size, img_size=224, augmentation=False,
+                              split="train", val_fraction=0.15, seed=42,
                               shuffle=True, num_workers=4):
-    ds = SynapseTrainDataset(root, img_size=img_size, augmentation=augmentation)
+    """`split="train"` (default) gives the training subset of train_npz's
+    cases; `split="val"` gives the held-out validation subset (same
+    val_fraction/seed => guaranteed disjoint from the train subset);
+    `split="all"` ignores the split and uses every case (old behavior)."""
+    ds = SynapseTrainDataset(root, img_size=img_size, augmentation=augmentation,
+                              split=split, val_fraction=val_fraction, seed=seed)
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -149,8 +214,23 @@ def get_synapse_train_loader(root, batch_size, img_size=224, augmentation=False,
     )
 
 
+def get_synapse_val_loader(root, batch_size, img_size=224, val_fraction=0.15,
+                            seed=42, num_workers=2):
+    """Fast 2D-slice validation loader meant to run every epoch. Augmentation
+    is always off and shuffling is off (order doesn't matter for eval, and
+    keeping it fixed makes debugging easier). Uses the same case-level split
+    as get_synapse_train_loader(seed=seed, val_fraction=val_fraction), so the
+    two are guaranteed not to overlap."""
+    return get_synapse_train_loader(
+        root, batch_size, img_size=img_size, augmentation=False, split="val",
+        val_fraction=val_fraction, seed=seed, shuffle=False, num_workers=num_workers,
+    )
+
+
 def get_synapse_volume_loader(root, img_size=224, num_workers=2):
-    """Batch size is always 1 volume at a time (volumes vary in slice count)."""
+    """Batch size is always 1 volume at a time (volumes vary in slice count).
+    This reads test_vol_h5 — the fully held-out test set, untouched by the
+    train/val split above."""
     ds = SynapseVolumeDataset(root, img_size=img_size)
     return DataLoader(
         ds,

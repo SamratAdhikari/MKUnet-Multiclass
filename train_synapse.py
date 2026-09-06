@@ -14,6 +14,7 @@ from utils.dataloader_synapse import (
     CLASS_NAMES,
     NUM_CLASSES,
     get_synapse_train_loader,
+    get_synapse_val_loader,
     get_synapse_volume_loader,
 )
 
@@ -102,11 +103,51 @@ def train_epoch(model, loader, optimizer, criterion, scaler, opt):
 
 
 @torch.no_grad()
+def evaluate_slices(model, loader, criterion, num_classes=NUM_CLASSES):
+    """Fast per-slice validation, meant to run every epoch: same loss the
+    model is trained with (averaged over deep-supervision heads) plus
+    per-class Dice/IoU accumulated over every validation slice. This is the
+    2D analogue of evaluate_volumes below, and is cheap enough to call after
+    every epoch (unlike the volumetric eval, which resizes/reconstructs full
+    3D cases and is only run periodically)."""
+    model.eval()
+    total_loss, n = 0.0, 0
+    inter = np.zeros(num_classes, dtype=np.float64)
+    psum = np.zeros(num_classes, dtype=np.float64)
+    gsum = np.zeros(num_classes, dtype=np.float64)
+
+    for images, masks in loader:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        outputs = model(images)
+        losses = [criterion(out, masks) for out in outputs]
+        loss = torch.stack(losses).mean()
+        total_loss += loss.item() * images.size(0)
+        n += images.size(0)
+
+        pred = torch.softmax(outputs[0], dim=1).argmax(dim=1)
+        for c in range(num_classes):
+            pc = (pred == c)
+            gc = (masks == c)
+            inter[c] += (pc & gc).sum().item()
+            psum[c] += pc.sum().item()
+            gsum[c] += gc.sum().item()
+
+    val_loss = total_loss / max(n, 1)
+    dice = (2 * inter + 1e-6) / (psum + gsum + 1e-6)
+    iou = (inter + 1e-6) / (psum + gsum - inter + 1e-6)
+    return val_loss, dice, iou
+
+
+@torch.no_grad()
 def evaluate_volumes(model, volume_loader, num_classes=NUM_CLASSES, img_size=224):
     """Per-case (per-volume) Dice, the standard Synapse evaluation protocol:
     run inference slice-by-slice, resize each prediction back to the
     original in-plane resolution, reconstruct the 3D volume, then compute
-    Dice per organ per case. Reported metric is the mean over cases."""
+    Dice per organ per case. Reported metric is the mean over cases. Runs on
+    the fully held-out test_vol_h5 volumes, so this is kept periodic
+    (opt.eval_interval) rather than every epoch."""
     model.eval()
     per_case_dice = []  # list of arrays, shape (num_classes,)
 
@@ -149,9 +190,21 @@ def main(opt):
     scaler = torch.cuda.amp.GradScaler(enabled=True) if (opt.amp and device.type == "cuda") else None
 
     train_loader = get_synapse_train_loader(
-        opt.data_root, opt.batchsize, opt.img_size, opt.augmentation, num_workers=opt.num_workers)
+        opt.data_root, opt.batchsize, opt.img_size, opt.augmentation,
+        split="train", val_fraction=opt.val_fraction, seed=opt.seed,
+        num_workers=opt.num_workers)
+    val_loader = get_synapse_val_loader(
+        opt.data_root, opt.val_batchsize, opt.img_size,
+        val_fraction=opt.val_fraction, seed=opt.seed,
+        num_workers=max(1, opt.num_workers // 2))
     test_vol_loader = get_synapse_volume_loader(
         opt.data_root, opt.img_size, num_workers=max(1, opt.num_workers // 2))
+
+    print(f"Train slices: {len(train_loader.dataset)} "
+          f"({len(train_loader.dataset.case_ids)} cases) | "
+          f"Val slices: {len(val_loader.dataset)} "
+          f"({len(val_loader.dataset.case_ids)} cases) | "
+          f"Test volumes: {len(test_vol_loader.dataset)}")
 
     run_id = f"Synapse_{opt.network}_bs{opt.batchsize}_sz{opt.img_size}_lr{opt.lr}_e{opt.epochs}_seed{opt.seed}_{time.strftime('%H%M%S')}"
     save_dir = os.path.join(opt.model_root, run_id)
@@ -165,31 +218,61 @@ def main(opt):
         loss = train_epoch(model, train_loader, optimizer, criterion, scaler, opt)
         torch.save(model.state_dict(), os.path.join(save_dir, f"{run_id}-last.pth"))
 
+        # Fast 2D validation, every epoch: val loss, per-class Dice, per-class IoU.
+        val_loss, val_dice, val_iou = evaluate_slices(model, val_loader, criterion, NUM_CLASSES)
+        val_fg_dice = float(np.mean(val_dice[1:]))
+        val_fg_iou = float(np.mean(val_iou[1:]))
+
+        record = {
+            "epoch": epoch,
+            "loss": loss,
+            "val_loss": val_loss,
+            "val_mean_fg_dice": val_fg_dice,
+            "val_mean_fg_iou": val_fg_iou,
+            **{f"val_dice_{CLASS_NAMES[c]}": float(val_dice[c]) for c in range(NUM_CLASSES)},
+            **{f"val_iou_{CLASS_NAMES[c]}": float(val_iou[c]) for c in range(NUM_CLASSES)},
+        }
+
+        print(f"Epoch {epoch:03d}/{opt.epochs} loss={loss:.4f} val_loss={val_loss:.4f} "
+              f"val_fg_dice={val_fg_dice:.4f} val_fg_iou={val_fg_iou:.4f} | "
+              + " ".join(f"{CLASS_NAMES[c]}={val_dice[c]:.3f}" for c in range(1, NUM_CLASSES)))
+
+        # Best checkpoint is selected on the (cheap, every-epoch) val set —
+        # test_vol_h5 stays untouched until the periodic/final check below.
+        if val_fg_dice > best_score:
+            best_score, best_epoch = val_fg_dice, epoch
+            torch.save(model.state_dict(), os.path.join(save_dir, f"{run_id}-best.pth"))
+
+        # Slower, periodic sanity check on the fully held-out test volumes.
         if epoch % opt.eval_interval == 0 or epoch == opt.epochs:
-            dice_per_class, _ = evaluate_volumes(model, test_vol_loader, NUM_CLASSES, opt.img_size)
-            fg_mean = float(np.nanmean(dice_per_class[1:]))
-            history.append({
-                "epoch": epoch, "loss": loss, "test_mean_fg_dice": fg_mean,
-                **{f"test_dice_{CLASS_NAMES[c]}": float(dice_per_class[c]) for c in range(NUM_CLASSES)},
+            test_dice_per_class, _ = evaluate_volumes(model, test_vol_loader, NUM_CLASSES, opt.img_size)
+            test_fg_mean = float(np.nanmean(test_dice_per_class[1:]))
+            record.update({
+                "test_mean_fg_dice": test_fg_mean,
+                **{f"test_dice_{CLASS_NAMES[c]}": float(test_dice_per_class[c]) for c in range(NUM_CLASSES)},
             })
-            print(f"Epoch {epoch:03d}/{opt.epochs} loss={loss:.4f} test_fg_dice={fg_mean:.4f} | "
-                  + " ".join(f"{CLASS_NAMES[c]}={dice_per_class[c]:.3f}" for c in range(1, NUM_CLASSES)))
-            if fg_mean > best_score:
-                best_score, best_epoch = fg_mean, epoch
-                torch.save(model.state_dict(), os.path.join(save_dir, f"{run_id}-best.pth"))
-        else:
-            print(f"Epoch {epoch:03d}/{opt.epochs} loss={loss:.4f}")
-            history.append({"epoch": epoch, "loss": loss})
+            print(f"           [periodic test-volume check] test_fg_dice={test_fg_mean:.4f} | "
+                  + " ".join(f"{CLASS_NAMES[c]}={test_dice_per_class[c]:.3f}" for c in range(1, NUM_CLASSES)))
+
+        history.append(record)
 
     best_path = os.path.join(save_dir, f"{run_id}-best.pth")
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, map_location=device))
-    dice_per_class, per_case = evaluate_volumes(model, test_vol_loader, NUM_CLASSES, opt.img_size)
+    val_loss, val_dice, val_iou = evaluate_slices(model, val_loader, criterion, NUM_CLASSES)
+    test_dice_per_class, per_case = evaluate_volumes(model, test_vol_loader, NUM_CLASSES, opt.img_size)
     summary = {
-        "run_id": run_id, "best_epoch": best_epoch, "best_test_mean_foreground_dice": best_score,
-        "final_test_mean_foreground_dice": float(np.nanmean(dice_per_class[1:])),
-        "test_dice_per_class": {CLASS_NAMES[c]: float(dice_per_class[c]) for c in range(NUM_CLASSES)},
+        "run_id": run_id,
+        "best_epoch": best_epoch,
+        "best_val_mean_foreground_dice": best_score,
+        "final_val_loss": val_loss,
+        "final_val_dice_per_class": {CLASS_NAMES[c]: float(val_dice[c]) for c in range(NUM_CLASSES)},
+        "final_val_iou_per_class": {CLASS_NAMES[c]: float(val_iou[c]) for c in range(NUM_CLASSES)},
+        "final_test_mean_foreground_dice": float(np.nanmean(test_dice_per_class[1:])),
+        "test_dice_per_class": {CLASS_NAMES[c]: float(test_dice_per_class[c]) for c in range(NUM_CLASSES)},
         "num_test_cases": int(per_case.shape[0]),
+        "num_train_cases": len(train_loader.dataset.case_ids),
+        "num_val_cases": len(val_loader.dataset.case_ids),
         "config": vars(opt),
     }
     with open(os.path.join(save_dir, "history.json"), "w") as f:
@@ -207,6 +290,10 @@ if __name__ == "__main__":
     p.add_argument("--model_root", default="./model_pth_synapse")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batchsize", type=int, default=16)
+    p.add_argument("--val_batchsize", type=int, default=16,
+                   help="batch size for the fast per-epoch 2D validation pass")
+    p.add_argument("--val_fraction", type=float, default=0.15,
+                   help="fraction of train_npz *cases* (not slices) held out for validation")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
@@ -217,6 +304,6 @@ if __name__ == "__main__":
     p.add_argument("--multi_scale", type=str2bool, default=True)
     p.add_argument("--dice_background", type=str2bool, default=False)
     p.add_argument("--eval_interval", type=int, default=10,
-                   help="Run the (slower) volumetric test evaluation every N epochs.")
+                   help="Run the (slower) volumetric test-set evaluation every N epochs.")
     p.add_argument("--num_workers", type=int, default=4)
     main(p.parse_args())
