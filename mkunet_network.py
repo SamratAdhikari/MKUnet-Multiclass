@@ -621,4 +621,3 @@ class MK_UNet(nn.Module):
             return [final, aux_1, aux_2, aux_3]
         return [final]
 
-# EOF

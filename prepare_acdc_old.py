@@ -5,7 +5,6 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from scipy.ndimage import zoom
 from tqdm import tqdm
 
 
@@ -24,29 +23,6 @@ def split_for(pid, train_end=80, val_end=100):
     if pid <= val_end:
         return "val"
     return "test"
-
-
-def resample_inplane(image, label, spacing_xy, target_spacing):
-    """Resample a (H, W, Z) image/label pair so every volume has the same
-    in-plane pixel spacing, regardless of the scanner's native spacing.
-
-    ACDC in-plane spacing varies roughly 0.7-1.9mm across patients/scanners.
-    Without this, the heart occupies a different physical size in different
-    training slices after the fixed 224x224 resize, which is pure noise the
-    network has to learn around. This runs once, at preprocessing time, on
-    CPU, so it costs nothing at training time.
-    """
-    sx, sy = spacing_xy
-    zx = sx / target_spacing
-    zy = sy / target_spacing
-
-    if np.isclose(zx, 1.0, atol=1e-3) and np.isclose(zy, 1.0, atol=1e-3):
-        return image, label
-
-    image_rs = zoom(image, (zx, zy, 1.0), order=3, mode="mirror")
-    label_rs = zoom(label, (zx, zy, 1.0), order=0, mode="nearest")
-
-    return image_rs.astype(np.float32), label_rs.astype(label.dtype)
 
 
 def normalize_volume(volume):
@@ -99,8 +75,7 @@ def main(args):
         split_dir = out_root / split
         split_dir.mkdir(parents=True, exist_ok=True)
 
-        image_nii = nib.load(str(image_path))
-        image = np.asarray(image_nii.get_fdata(), dtype=np.float32)
+        image = np.asarray(nib.load(str(image_path)).get_fdata(), dtype=np.float32)
         label = np.asarray(nib.load(str(gt_path)).get_fdata(), dtype=np.int16)
 
         if image.shape != label.shape:
@@ -108,9 +83,6 @@ def main(args):
 
         if label.min() < 0 or label.max() > 3:
             raise ValueError(f"Unexpected labels in {gt_path}: min={label.min()}, max={label.max()}")
-
-        spacing_xy = image_nii.header.get_zooms()[:2]
-        image, label = resample_inplane(image, label, spacing_xy, args.target_spacing)
 
         image = normalize_volume(image)
         stem = image_path.stem
@@ -121,8 +93,7 @@ def main(args):
             np.savez_compressed(
                 out_path,
                 image=image[:, :, z],
-                label=label[:, :, z].astype(np.uint8),
-                spacing=np.array([args.target_spacing, args.target_spacing], dtype=np.float32),
+                label=label[:, :, z].astype(np.uint8)
             )
 
             counts[split] += 1
@@ -142,7 +113,6 @@ def main(args):
 
     print(f"Image/GT pairs: {len(pairs)}")
     print(f"Output root: {out_root}")
-    print(f"Resampled in-plane spacing: {args.target_spacing}mm isotropic")
 
 
 if __name__ == "__main__":
@@ -151,9 +121,5 @@ if __name__ == "__main__":
     parser.add_argument("--out_root", default="./data/ACDC_npz")
     parser.add_argument("--train_end", type=int, default=80)
     parser.add_argument("--val_end", type=int, default=100)
-    parser.add_argument("--target_spacing", type=float, default=1.25,
-                        help="Target in-plane pixel spacing in mm. All volumes are "
-                             "resampled to this spacing before slicing so anatomy has "
-                             "a consistent physical size across patients/scanners.")
 
     main(parser.parse_args())
