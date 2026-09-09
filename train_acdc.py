@@ -3,13 +3,11 @@ import json
 import os
 import random
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy import ndimage
 
 from mkunet_network import MK_UNet
 from utils.dataloader_acdc import get_acdc_loader
@@ -29,39 +27,14 @@ def seed_everything(seed):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
-def compute_class_weights(data_root, split="train", num_classes=4, cap=10.0):
-    """Median-frequency balancing weights from the raw pixel counts.
-
-    Myocardium is the smallest foreground structure by pixel count and was
-    previously weighted identically to background/RV/LV in the CE loss, so
-    the network had no extra incentive to get its (already worst) class
-    right. This scans the prepared NPZ label maps once, up front, and is
-    cheap relative to a full training run.
-    """
-    files = sorted((Path(data_root) / split).glob("*.npz"))
-    counts = np.zeros(num_classes, dtype=np.float64)
-    for f in files:
-        with np.load(f) as d:
-            label = d["label"]
-        counts += np.bincount(label.ravel(), minlength=num_classes)[:num_classes]
-
-    freqs = counts / counts.sum()
-    freqs = np.clip(freqs, 1e-12, None)
-    median_freq = np.median(freqs)
-    weights = median_freq / freqs
-    weights = np.clip(weights, None, cap)
-    return torch.tensor(weights, dtype=torch.float32)
-
-
 class DiceCELoss(nn.Module):
-    def __init__(self, num_classes=4, ce_weight=0.5, dice_weight=0.5, include_background=False,
-                class_weights=None):
+    def __init__(self, num_classes=4, ce_weight=0.5, dice_weight=0.5, include_background=False):
         super().__init__()
         self.num_classes = num_classes
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
         self.include_background = include_background
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.ce = nn.CrossEntropyLoss()
 
     def dice_loss(self, logits, target):
         probs = torch.softmax(logits, dim=1)
@@ -78,42 +51,7 @@ class DiceCELoss(nn.Module):
         return self.ce_weight * self.ce(logits, target) + self.dice_weight * self.dice_loss(logits, target)
 
 
-def tta_predict(model, images):
-    """Flip-based test-time augmentation, averaged in probability space.
-    Inference-only and roughly 3x the forward-pass cost of a single pass —
-    no retraining required."""
-    probs = torch.softmax(model(images)[0], dim=1)
-
-    flipped_w = torch.flip(model(torch.flip(images, dims=[3]))[0], dims=[3])
-    probs = probs + torch.softmax(flipped_w, dim=1)
-
-    flipped_h = torch.flip(model(torch.flip(images, dims=[2]))[0], dims=[2])
-    probs = probs + torch.softmax(flipped_h, dim=1)
-
-    return probs / 3.0
-
-
-def keep_largest_component(pred_slice, num_classes=4):
-    """Per foreground class, keep only the largest connected component.
-    Cardiac MR segmentation should produce a single blob per structure per
-    slice; this removes spurious disconnected islands the network predicts.
-    Inference-only post-processing, no retraining required."""
-    cleaned = np.zeros_like(pred_slice)
-    for c in range(1, num_classes):
-        mask_c = pred_slice == c
-        if not mask_c.any():
-            continue
-        labeled, n_components = ndimage.label(mask_c)
-        if n_components <= 1:
-            cleaned[mask_c] = c
-            continue
-        sizes = ndimage.sum(mask_c, labeled, index=range(1, n_components + 1))
-        largest_label = int(np.argmax(sizes)) + 1
-        cleaned[labeled == largest_label] = c
-    return cleaned
-
-
-def aggregate_metrics(model, loader, num_classes=4, tta=False, postprocess=False):
+def aggregate_metrics(model, loader, num_classes=4):
     model.eval()
     inter = torch.zeros(num_classes, dtype=torch.float64)
     pred_sum = torch.zeros(num_classes, dtype=torch.float64)
@@ -121,26 +59,10 @@ def aggregate_metrics(model, loader, num_classes=4, tta=False, postprocess=False
     with torch.no_grad():
         for batch in loader:
             images, masks = batch[0].to(device), batch[1].to(device)
-
-            if tta:
-                probs = tta_predict(model, images)
-            else:
-                logits = model(images)[0]
-                if logits.shape[-2:] != masks.shape[-2:]:
-                    logits = F.interpolate(logits, masks.shape[-2:], mode="bilinear", align_corners=False)
-                probs = torch.softmax(logits, dim=1)
-
-            if probs.shape[-2:] != masks.shape[-2:]:
-                probs = F.interpolate(probs, masks.shape[-2:], mode="bilinear", align_corners=False)
-
-            pred = probs.argmax(dim=1)
-
-            if postprocess:
-                pred_np = pred.cpu().numpy()
-                for i in range(pred_np.shape[0]):
-                    pred_np[i] = keep_largest_component(pred_np[i], num_classes)
-                pred = torch.from_numpy(pred_np).to(device)
-
+            logits = model(images)[0]
+            if logits.shape[-2:] != masks.shape[-2:]:
+                logits = F.interpolate(logits, masks.shape[-2:], mode="bilinear", align_corners=False)
+            pred = torch.softmax(logits, dim=1).argmax(dim=1)
             for c in range(num_classes):
                 pc = pred == c; gc = masks == c
                 inter[c] += (pc & gc).sum().cpu()
@@ -149,21 +71,6 @@ def aggregate_metrics(model, loader, num_classes=4, tta=False, postprocess=False
     dice = (2 * inter + 1e-6) / (pred_sum + gt_sum + 1e-6)
     iou = (inter + 1e-6) / (pred_sum + gt_sum - inter + 1e-6)
     return dice.numpy(), iou.numpy()
-
-
-def adjust_lr(optimizer, base_lr, epoch, total_epochs, power=0.9, warmup_epochs=5):
-    """Poly LR decay with linear warmup. A constant LR for 150 epochs leaves
-    accuracy on the table for free; this costs nothing extra at train time."""
-    if warmup_epochs > 0 and epoch <= warmup_epochs:
-        lr = base_lr * epoch / warmup_epochs
-    else:
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        progress = min(max(progress, 0.0), 1.0)
-        lr = base_lr * (1 - progress) ** power
-
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
-    return lr
 
 
 def amp_context(enabled):
@@ -218,15 +125,7 @@ def main(opt):
         "MK_UNet_L": [64,128,256,384,512],
     }
     model = MK_UNet(num_classes=4, in_channels=1, channels=configs[opt.network], deep_supervision=True).to(device)
-
-    if opt.class_weighting:
-        class_weights = compute_class_weights(opt.data_root, "train", 4).to(device)
-        print("Class weights (median-frequency balancing):",
-              {CLASS_NAMES[c]: round(float(class_weights[c]), 4) for c in range(4)})
-    else:
-        class_weights = None
-
-    criterion = DiceCELoss(num_classes=4, include_background=opt.dice_background, class_weights=class_weights)
+    criterion = DiceCELoss(num_classes=4, include_background=opt.dice_background)
     optimizer = torch.optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=opt.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=True) if (opt.amp and device.type == "cuda") else None
 
@@ -242,14 +141,12 @@ def main(opt):
     print("Run ID:", run_id)
     print("Device:", device)
     for epoch in range(1, opt.epochs + 1):
-        cur_lr = adjust_lr(optimizer, opt.lr, epoch, opt.epochs, power=opt.lr_power,
-                           warmup_epochs=opt.warmup_epochs) if opt.lr_schedule == "poly" else opt.lr
         loss = train_epoch(model, train_loader, optimizer, criterion, scaler, opt)
         vd, vi = aggregate_metrics(model, val_loader, 4)
         fg_mean = float(vd[1:].mean())
-        history.append({"epoch": epoch, "loss": loss, "lr": cur_lr, "val_mean_fg_dice": fg_mean,
+        history.append({"epoch": epoch, "loss": loss, "val_mean_fg_dice": fg_mean,
                         **{f"val_dice_{CLASS_NAMES[c]}": float(vd[c]) for c in range(4)}})
-        print(f"Epoch {epoch:03d}/{opt.epochs} lr={cur_lr:.6f} loss={loss:.4f} val_fg_dice={fg_mean:.4f} "
+        print(f"Epoch {epoch:03d}/{opt.epochs} loss={loss:.4f} val_fg_dice={fg_mean:.4f} "
               f"RV={vd[1]:.4f} MYO={vd[2]:.4f} LV={vd[3]:.4f}")
         torch.save(model.state_dict(), os.path.join(save_dir, f"{run_id}-last.pth"))
         if fg_mean > best_score:
@@ -257,10 +154,7 @@ def main(opt):
             torch.save(model.state_dict(), os.path.join(save_dir, f"{run_id}-best.pth"))
 
     model.load_state_dict(torch.load(os.path.join(save_dir, f"{run_id}-best.pth"), map_location=device))
-    # TTA + connected-component post-processing are inference-only (no retraining
-    # cost) so they're applied here, at final test evaluation, rather than every
-    # epoch during validation where they'd only slow down model selection.
-    td, ti = aggregate_metrics(model, test_loader, 4, tta=opt.tta, postprocess=opt.postprocess)
+    td, ti = aggregate_metrics(model, test_loader, 4)
     summary = {
         "run_id": run_id, "best_epoch": best_epoch, "best_val_mean_foreground_dice": best_score,
         "test_mean_foreground_dice": float(td[1:].mean()),
@@ -292,15 +186,4 @@ if __name__ == "__main__":
     p.add_argument("--multi_scale", type=str2bool, default=True)
     p.add_argument("--dice_background", type=str2bool, default=False)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--lr_schedule", default="poly", choices=["poly", "none"],
-                   help="Poly LR decay with warmup, or a constant LR ('none').")
-    p.add_argument("--lr_power", type=float, default=0.9, help="Poly decay exponent.")
-    p.add_argument("--warmup_epochs", type=int, default=5, help="Linear warmup epochs for the LR schedule.")
-    p.add_argument("--class_weighting", type=str2bool, default=True,
-                   help="Median-frequency class weighting in the CE term (helps the smallest "
-                        "class, myocardium, which is otherwise weighted like every other class).")
-    p.add_argument("--tta", type=str2bool, default=True,
-                   help="Flip-based test-time augmentation for the final test evaluation. Inference-only.")
-    p.add_argument("--postprocess", type=str2bool, default=True,
-                   help="Keep only the largest connected component per foreground class at test time. Inference-only.")
     main(p.parse_args())
