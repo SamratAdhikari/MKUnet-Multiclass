@@ -30,7 +30,8 @@ def evaluate(y_true, y_pred):
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
         "classification_report": classification_report(
-            y_true, y_pred,
+            y_true,
+            y_pred,
             labels=list(range(len(LABELS))),
             target_names=LABELS,
             output_dict=True,
@@ -73,31 +74,52 @@ def main(opt):
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required feature columns: {missing}")
-    if "label" not in df or "split" not in df:
+    if "label" not in df.columns or "split" not in df.columns:
         raise KeyError("Feature CSV must contain 'label' and 'split' columns")
 
-    unknown = sorted(set(df["label"].astype(str).str.upper()) - set(LABELS))
+    df["label"] = df["label"].astype(str).str.upper().str.strip()
+    unknown = sorted(set(df["label"]) - set(LABELS))
     if unknown:
         raise ValueError(f"Unknown labels in CSV: {unknown}")
-    df["label"] = df["label"].astype(str).str.upper()
-    df["y"] = df["label"].map(LABEL_TO_ID)
+    df["y"] = df["label"].map(LABEL_TO_ID).astype(int)
 
     out_dir = Path(opt.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df = df[df["split"].isin(opt.train_splits.split(","))].copy()
+    train_splits = [x.strip() for x in opt.train_splits.split(",") if x.strip()]
+    train_df = df[df["split"].isin(train_splits)].copy()
     val_df = df[df["split"] == "val"].copy()
     test_df = df[df["split"] == "test"].copy()
     if train_df.empty or test_df.empty:
-        raise RuntimeError(f"Need non-empty train and test rows; counts={df['split'].value_counts().to_dict()}")
+        raise RuntimeError(
+            f"Need non-empty train and test rows; counts={df['split'].value_counts().to_dict()}"
+        )
+
+    # XGBoost's sklearn API requires the labels used for fitting to be contiguous
+    # 0..K-1.  A patient-ID split can occasionally omit one of the five ACDC
+    # groups from the training subset, so map the *present* global ACDC class IDs
+    # to local contiguous IDs for fitting. Predictions are mapped back afterwards.
+    global_train_ids = sorted(int(x) for x in train_df["y"].unique())
+    if len(global_train_ids) < 2:
+        raise RuntimeError(
+            "XGBoost diagnosis needs at least two classes in the training split. "
+            f"Observed labels: {[ID_TO_LABEL[i] for i in global_train_ids]}"
+        )
+    global_to_local = {gid: i for i, gid in enumerate(global_train_ids)}
+    local_to_global = {i: gid for gid, i in global_to_local.items()}
+
+    print("Rows by split:", df["split"].value_counts().to_dict())
+    print("Labels by split:\n", pd.crosstab(df["split"], df["label"]))
+    print("Training classes:", [ID_TO_LABEL[i] for i in global_train_ids])
 
     imputer = SimpleImputer(strategy="median")
     X_train = imputer.fit_transform(train_df[FEATURE_COLUMNS])
-    y_train = train_df["y"].to_numpy()
+    y_train_global = train_df["y"].to_numpy(dtype=int)
+    y_train_local = np.asarray([global_to_local[int(y)] for y in y_train_global], dtype=int)
 
     model = XGBClassifier(
         objective="multi:softprob",
-        num_class=len(LABELS),
+        num_class=len(global_train_ids),
         n_estimators=opt.n_estimators,
         max_depth=opt.max_depth,
         learning_rate=opt.learning_rate,
@@ -111,13 +133,15 @@ def main(opt):
         random_state=opt.seed,
         n_jobs=-1,
     )
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train_local)
 
     bundle = {
         "imputer": imputer,
         "model": model,
         "feature_columns": FEATURE_COLUMNS,
         "labels": LABELS,
+        "global_to_local": global_to_local,
+        "local_to_global": local_to_global,
     }
     joblib.dump(bundle, out_dir / "xgboost_diagnosis.joblib")
 
@@ -127,6 +151,7 @@ def main(opt):
         "val_rows": int(len(val_df)),
         "test_rows": int(len(test_df)),
         "feature_columns": FEATURE_COLUMNS,
+        "training_classes": [ID_TO_LABEL[i] for i in global_train_ids],
         "xgboost_params": model.get_params(),
     }
 
@@ -134,27 +159,43 @@ def main(opt):
         if part.empty:
             continue
         X = imputer.transform(part[FEATURE_COLUMNS])
-        y_true = part["y"].to_numpy()
-        prob = model.predict_proba(X)
-        y_pred = prob.argmax(axis=1)
+        y_true = part["y"].to_numpy(dtype=int)
+        prob_local = model.predict_proba(X)
+        pred_local = np.asarray(prob_local).argmax(axis=1)
+        y_pred = np.asarray([local_to_global[int(i)] for i in pred_local], dtype=int)
         all_metrics[split_name] = evaluate(y_true, y_pred)
 
         pred_df = part[["patient_id", "patient", "split", "label"]].copy()
         pred_df["predicted_label"] = [ID_TO_LABEL[int(i)] for i in y_pred]
         pred_df["correct"] = pred_df["label"] == pred_df["predicted_label"]
+
+        # Always emit probability columns for all five ACDC classes. Classes that
+        # were absent during fit receive probability 0.0.
+        full_prob = np.zeros((len(part), len(LABELS)), dtype=float)
+        for local_idx, global_idx in local_to_global.items():
+            full_prob[:, int(global_idx)] = prob_local[:, int(local_idx)]
         for i, label in enumerate(LABELS):
-            pred_df[f"prob_{label}"] = prob[:, i]
+            pred_df[f"prob_{label}"] = full_prob[:, i]
+
         pred_df.to_csv(out_dir / f"predictions_{split_name}.csv", index=False)
-        plot_confusion(y_true, y_pred, f"XGBoost diagnosis — {split_name}", out_dir / f"confusion_{split_name}.png")
+        plot_confusion(
+            y_true,
+            y_pred,
+            f"XGBoost diagnosis — {split_name}",
+            out_dir / f"confusion_{split_name}.png",
+        )
 
     plot_importance(model, FEATURE_COLUMNS, out_dir / "feature_importance.png", opt.top_features)
     (out_dir / "metrics.json").write_text(json.dumps(all_metrics, indent=2, default=str))
 
-    print(json.dumps({
-        k: ({m: v for m, v in val.items() if m != "classification_report"} if isinstance(val, dict) and "classification_report" in val else val)
-        for k, val in all_metrics.items() if k in ("train", "val", "test")
-    }, indent=2))
-    print("Saved:", out_dir)
+    short_metrics = {
+        k: {m: v for m, v in val.items() if m != "classification_report"}
+        for k, val in all_metrics.items()
+        if k in ("train", "val", "test") and isinstance(val, dict)
+    }
+    print(json.dumps(short_metrics, indent=2))
+    print("Saved:", out_dir.resolve())
+    print("metrics.json:", (out_dir / "metrics.json").resolve())
 
 
 if __name__ == "__main__":
