@@ -169,38 +169,58 @@ def _slice_contraction(ed: np.ndarray, es: np.ndarray, class_id: int) -> dict[st
 
 
 def cardiac_features(ed_mask, es_mask, ed_zooms, es_zooms, height_cm, weight_kg) -> dict:
-    """Compact, clinically interpretable biomarker set."""
+    """Full segmentation-derived cardiac biomarker set used by Experiments 1 and 3.
+
+    The same columns are computed from expert masks (Experiment 1) and MK-UNet
+    predicted masks (Experiment 3), enabling a direct apples-to-apples comparison.
+    """
     lv_edv = _volume_ml(ed_mask, CLASS_IDS["LV"], ed_zooms)
     lv_esv = _volume_ml(es_mask, CLASS_IDS["LV"], es_zooms)
     rv_edv = _volume_ml(ed_mask, CLASS_IDS["RV"], ed_zooms)
     rv_esv = _volume_ml(es_mask, CLASS_IDS["RV"], es_zooms)
     myo_edv = _volume_ml(ed_mask, CLASS_IDS["MYO"], ed_zooms)
+    myo_esv = _volume_ml(es_mask, CLASS_IDS["MYO"], es_zooms)
 
     lv_sv = lv_edv - lv_esv
     rv_sv = rv_edv - rv_esv
     lv_ef = 100.0 * _ratio(lv_sv, lv_edv)
     rv_ef = 100.0 * _ratio(rv_sv, rv_edv)
-    myo_mass = myo_edv * 1.05
+
     bsa = bsa_mosteller(height_cm, weight_kg)
+    myo_mass = myo_edv * 1.05
+
     lv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["LV"])
+    rv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["RV"])
 
     return {
-        "bsa_m2": bsa,
+        "height_cm": float(height_cm),
+        "weight_kg": float(weight_kg),
+        "bsa_m2": float(bsa),
         "lv_edv_ml": lv_edv,
         "lv_esv_ml": lv_esv,
+        "lv_sv_ml": lv_sv,
         "lv_ef_pct": lv_ef,
         "rv_edv_ml": rv_edv,
         "rv_esv_ml": rv_esv,
+        "rv_sv_ml": rv_sv,
         "rv_ef_pct": rv_ef,
+        "myo_edv_ml": myo_edv,
+        "myo_esv_ml": myo_esv,
         "myo_mass_g": myo_mass,
+        "lv_edvi_ml_m2": _ratio(lv_edv, bsa),
+        "lv_esvi_ml_m2": _ratio(lv_esv, bsa),
+        "rv_edvi_ml_m2": _ratio(rv_edv, bsa),
+        "rv_esvi_ml_m2": _ratio(rv_esv, bsa),
+        "myo_mass_g_m2": _ratio(myo_mass, bsa),
         "lv_rv_edv_ratio": _ratio(lv_edv, rv_edv),
         "myo_lv_ed_ratio": _ratio(myo_edv, lv_edv),
         "lv_slice_contraction_mean": lv_con["mean"],
         "lv_slice_contraction_std": lv_con["std"],
         "lv_slice_contraction_min": lv_con["min"],
         "lv_slice_contraction_max": lv_con["max"],
+        "rv_slice_contraction_mean": rv_con["mean"],
+        "rv_slice_contraction_std": rv_con["std"],
     }
-
 
 def extract_gt_mask_features(data_root: Path, cohort_csv: Path, output_csv: Path) -> pd.DataFrame:
     """Experiment 1: expert ACDC segmentation masks -> biomarkers."""
@@ -447,13 +467,28 @@ def _metric_dict(y_true, y_pred) -> dict:
     }
 
 
+def _summary_from_fold_metrics(fold_metrics: pd.DataFrame, prefix: str) -> dict:
+    return {
+        metric: {
+            "mean": float(fold_metrics[f"{prefix}_{metric}"].mean()),
+            "std": float(fold_metrics[f"{prefix}_{metric}"].std(ddof=0)),
+        }
+        for metric in ["accuracy", "balanced_accuracy", "macro_f1"]
+    }
+
+
 def cross_validate_and_train(
     features_csv: Path,
     output_dir: Path,
     seed: int = 7,
     n_splits: int = 5,
 ) -> dict:
-    """5-fold stratified CV on patients 1-100, then final training on all 100 and one test on 101-150."""
+    """Exact 5-fold stratified CV on patients 1-100, then final held-out testing.
+
+    For every fold we report BOTH training and validation metrics. After CV, a
+    fresh final model is fitted on all development patients (1-100), its train
+    performance is recorded, and it is evaluated once on patients 101-150.
+    """
     df = pd.read_csv(features_csv)
     feature_columns = [c for c in df.columns if c not in META_COLUMNS]
     development = df[df.cohort == "development"].copy().reset_index(drop=True)
@@ -479,14 +514,21 @@ def cross_validate_and_train(
 
         model = _make_xgb(seed + fold)
         model.fit(X_train, y_train)
-        pred = model.predict(X_val).astype(int)
 
-        scores = _metric_dict(y_val, pred)
-        fold_rows.append({"fold": fold, **scores})
+        train_pred = model.predict(X_train).astype(int)
+        val_pred = model.predict(X_val).astype(int)
+        train_scores = _metric_dict(y_train, train_pred)
+        val_scores = _metric_dict(y_val, val_pred)
+
+        fold_rows.append({
+            "fold": fold,
+            **{f"train_{k}": v for k, v in train_scores.items()},
+            **{f"val_{k}": v for k, v in val_scores.items()},
+        })
         oof_true[val_idx] = y_val
-        oof_pred[val_idx] = pred
+        oof_pred[val_idx] = val_pred
 
-        for row_i, pred_i in zip(val_idx, pred):
+        for row_i, pred_i in zip(val_idx, val_pred):
             row = development.iloc[row_i]
             oof_rows.append({
                 "fold": fold,
@@ -498,23 +540,24 @@ def cross_validate_and_train(
 
     fold_metrics = pd.DataFrame(fold_rows)
     cv_summary = {
-        metric: {
-            "mean": float(fold_metrics[metric].mean()),
-            "std": float(fold_metrics[metric].std(ddof=0)),
-        }
-        for metric in ["accuracy", "balanced_accuracy", "macro_f1"]
+        "train": _summary_from_fold_metrics(fold_metrics, "train"),
+        "validation": _summary_from_fold_metrics(fold_metrics, "val"),
     }
 
-    imputer = SimpleImputer(strategy="median")
-    X_dev = imputer.fit_transform(development[feature_columns])
-    X_test = imputer.transform(test[feature_columns])
+    # Final model: fit once on every development patient, then evaluate the untouched test cohort.
+    final_imputer = SimpleImputer(strategy="median")
+    X_dev = final_imputer.fit_transform(development[feature_columns])
+    X_test = final_imputer.transform(test[feature_columns])
     y_test = test.label.map(LABEL_TO_ID).to_numpy(dtype=int)
 
     final_model = _make_xgb(seed)
     final_model.fit(X_dev, y_dev)
+
+    final_train_pred = final_model.predict(X_dev).astype(int)
+    final_train_metrics = _metric_dict(y_dev, final_train_pred)
+
     probability = final_model.predict_proba(X_test)
     test_pred = probability.argmax(axis=1)
-
     test_report = classification_report(
         y_test,
         test_pred,
@@ -532,7 +575,9 @@ def cross_validate_and_train(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fold_metrics.to_csv(output_dir / "cv_fold_metrics.csv", index=False)
-    pd.DataFrame(oof_rows).sort_values("patient_id").to_csv(output_dir / "cv_predictions.csv", index=False)
+    pd.DataFrame(oof_rows).sort_values("patient_id").to_csv(
+        output_dir / "cv_predictions.csv", index=False
+    )
 
     test_predictions = test[["patient_id", "patient", "cohort", "label"]].copy()
     test_predictions["predicted_label"] = [ID_TO_LABEL[int(i)] for i in test_pred]
@@ -544,27 +589,68 @@ def cross_validate_and_train(
     joblib.dump(
         {
             "model": final_model,
-            "imputer": imputer,
+            "imputer": final_imputer,
             "feature_columns": feature_columns,
             "labels": LABELS,
         },
         output_dir / "model.joblib",
     )
 
-    _plot_confusion(oof_true, oof_pred, output_dir / "confusion_cv_oof.png", "5-fold CV out-of-fold confusion")
-    _plot_confusion(y_test, test_pred, output_dir / "confusion_test.png", "Independent test confusion")
+    _plot_confusion(
+        oof_true, oof_pred, output_dir / "confusion_cv_oof.png",
+        "5-fold CV out-of-fold confusion"
+    )
+    _plot_confusion(
+        y_test, test_pred, output_dir / "confusion_test.png",
+        "Independent test confusion"
+    )
     _plot_importance(final_model, feature_columns, output_dir / "feature_importance.png")
 
     metrics = {
         "cv": cv_summary,
+        "final_train": final_train_metrics,
         "test": test_metrics,
         "n_development": int(len(development)),
         "n_test": int(len(test)),
         "n_splits": int(n_splits),
+        "n_features": int(len(feature_columns)),
+        "feature_columns": feature_columns,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     return metrics
 
+
+def metrics_display_table(metrics: dict) -> pd.DataFrame:
+    """Clear Train / Validation / Test summary for notebook display."""
+    train_cv = metrics["cv"]["train"]
+    val_cv = metrics["cv"]["validation"]
+
+    return pd.DataFrame([
+        {
+            "Dataset": "5-Fold CV Train (mean ± std)",
+            "Accuracy": f"{train_cv['accuracy']['mean']:.4f} ± {train_cv['accuracy']['std']:.4f}",
+            "Balanced Accuracy": f"{train_cv['balanced_accuracy']['mean']:.4f} ± {train_cv['balanced_accuracy']['std']:.4f}",
+            "Macro F1": f"{train_cv['macro_f1']['mean']:.4f} ± {train_cv['macro_f1']['std']:.4f}",
+        },
+        {
+            "Dataset": "5-Fold CV Validation (mean ± std)",
+            "Accuracy": f"{val_cv['accuracy']['mean']:.4f} ± {val_cv['accuracy']['std']:.4f}",
+            "Balanced Accuracy": f"{val_cv['balanced_accuracy']['mean']:.4f} ± {val_cv['balanced_accuracy']['std']:.4f}",
+            "Macro F1": f"{val_cv['macro_f1']['mean']:.4f} ± {val_cv['macro_f1']['std']:.4f}",
+        },
+        {
+            "Dataset": "Final Train — patients 001–100",
+            "Accuracy": f"{metrics['final_train']['accuracy']:.4f}",
+            "Balanced Accuracy": f"{metrics['final_train']['balanced_accuracy']:.4f}",
+            "Macro F1": f"{metrics['final_train']['macro_f1']:.4f}",
+        },
+        {
+            "Dataset": "Independent Test — patients 101–150",
+            "Accuracy": f"{metrics['test']['accuracy']:.4f}",
+            "Balanced Accuracy": f"{metrics['test']['balanced_accuracy']:.4f}",
+            "Macro F1": f"{metrics['test']['macro_f1']:.4f}",
+        },
+    ])
 
 def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Path):
     output_dir = Path(output_dir)
@@ -575,13 +661,21 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     for name, (metrics, _) in experiments.items():
         rows.append({
             "Pipeline": name,
-            "CV Accuracy Mean": metrics["cv"]["accuracy"]["mean"],
-            "CV Accuracy Std": metrics["cv"]["accuracy"]["std"],
-            "CV Macro F1 Mean": metrics["cv"]["macro_f1"]["mean"],
-            "CV Macro F1 Std": metrics["cv"]["macro_f1"]["std"],
+            "CV Train Accuracy Mean": metrics["cv"]["train"]["accuracy"]["mean"],
+            "CV Train Accuracy Std": metrics["cv"]["train"]["accuracy"]["std"],
+            "CV Val Accuracy Mean": metrics["cv"]["validation"]["accuracy"]["mean"],
+            "CV Val Accuracy Std": metrics["cv"]["validation"]["accuracy"]["std"],
+            "CV Train Macro F1 Mean": metrics["cv"]["train"]["macro_f1"]["mean"],
+            "CV Train Macro F1 Std": metrics["cv"]["train"]["macro_f1"]["std"],
+            "CV Val Macro F1 Mean": metrics["cv"]["validation"]["macro_f1"]["mean"],
+            "CV Val Macro F1 Std": metrics["cv"]["validation"]["macro_f1"]["std"],
+            "Final Train Accuracy": metrics["final_train"]["accuracy"],
+            "Final Train Balanced Accuracy": metrics["final_train"]["balanced_accuracy"],
+            "Final Train Macro F1": metrics["final_train"]["macro_f1"],
             "Test Accuracy": metrics["test"]["accuracy"],
             "Test Balanced Accuracy": metrics["test"]["balanced_accuracy"],
             "Test Macro F1": metrics["test"]["macro_f1"],
+            "Number of Features": metrics["n_features"],
         })
         report = metrics["test"]["classification_report"]
         for label in LABELS:
@@ -592,6 +686,7 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     comparison.to_csv(output_dir / "pipeline_comparison.csv", index=False)
     per_class.to_csv(output_dir / "per_class_f1.csv", index=False)
 
+    # Final held-out test comparison.
     ax = comparison.set_index("Pipeline")[[
         "Test Accuracy", "Test Balanced Accuracy", "Test Macro F1"
     ]].plot(kind="bar", figsize=(10, 5.5), rot=15)
@@ -602,21 +697,35 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     plt.savefig(output_dir / "test_pipeline_comparison.png", dpi=180, bbox_inches="tight")
     plt.close()
 
+    # CV train-vs-validation comparison exposes overfitting directly.
+    stage = comparison.set_index("Pipeline")[[
+        "CV Train Macro F1 Mean", "CV Val Macro F1 Mean"
+    ]].copy()
+    stage.columns = ["CV Train Macro F1", "CV Validation Macro F1"]
+    ax = stage.plot(kind="bar", figsize=(10, 5.5), rot=15)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Macro F1")
+    ax.set_title("5-fold CV: training vs validation performance")
+    plt.tight_layout()
+    plt.savefig(output_dir / "cv_train_vs_validation.png", dpi=180, bbox_inches="tight")
+    plt.close()
+
+    # CV validation Macro-F1 with fold variability.
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(comparison))
     ax.errorbar(
         x,
-        comparison["CV Macro F1 Mean"],
-        yerr=comparison["CV Macro F1 Std"],
+        comparison["CV Val Macro F1 Mean"],
+        yerr=comparison["CV Val Macro F1 Std"],
         fmt="o",
         capsize=5,
     )
     ax.set_xticks(x, comparison["Pipeline"], rotation=15, ha="right")
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Macro F1")
-    ax.set_title("5-fold CV Macro-F1: mean ± standard deviation")
+    ax.set_title("5-fold validation Macro-F1: mean ± standard deviation")
     fig.tight_layout()
-    fig.savefig(output_dir / "cv_macro_f1_comparison.png", dpi=180, bbox_inches="tight")
+    fig.savefig(output_dir / "cv_validation_macro_f1.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
     pivot = per_class.pivot(index="Class", columns="Pipeline", values="F1").reindex(LABELS)
@@ -629,7 +738,6 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     plt.close()
 
     return comparison, pivot
-
 
 def export_bundle(
     results_dir: Path,
