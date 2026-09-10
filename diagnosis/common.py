@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 CLASS_IDS = {"RV": 1, "MYO": 2, "LV": 3}
 LABELS = ["NOR", "MINF", "DCM", "HCM", "RV"]
@@ -45,12 +46,55 @@ FEATURE_COLUMNS = [
 ]
 
 
-def split_for(pid: int, train_end: int = 80, val_end: int = 100) -> str:
-    if pid <= train_end:
-        return "train"
-    if pid <= val_end:
-        return "val"
-    return "test"
+def load_diagnosis_split(path: Path) -> Dict[int, Dict[str, str]]:
+    """Load the single patient-level split shared by GT and MK-UNet diagnosis.
+
+    The CSV must contain patient_id, split and label.  Using one persisted table
+    prevents the two feature sources from accidentally receiving different
+    random train/validation assignments.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Diagnosis split CSV not found: {path}. "
+            "Run create_diagnosis_split.py first."
+        )
+    df = pd.read_csv(path)
+    required = {"patient_id", "split", "label"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"Diagnosis split CSV is missing columns: {sorted(missing)}")
+
+    df["patient_id"] = df["patient_id"].astype(int)
+    df["split"] = df["split"].astype(str).str.lower().str.strip()
+    df["label"] = df["label"].astype(str).str.upper().str.strip().replace({"ARV": "RV"})
+
+    if df["patient_id"].duplicated().any():
+        raise ValueError("Diagnosis split CSV contains duplicate patient IDs")
+    unknown_splits = sorted(set(df["split"]) - {"train", "val", "test"})
+    if unknown_splits:
+        raise ValueError(f"Unknown diagnosis split names: {unknown_splits}")
+    unknown_labels = sorted(set(df["label"]) - set(LABELS))
+    if unknown_labels:
+        raise ValueError(f"Unknown ACDC diagnosis labels in split CSV: {unknown_labels}")
+
+    return {
+        int(r.patient_id): {"split": str(r.split), "label": str(r.label)}
+        for r in df.itertuples(index=False)
+    }
+
+
+def diagnosis_split_for(pid: int, label: str, split_map: Dict[int, Dict[str, str]]) -> str:
+    if pid not in split_map:
+        raise KeyError(f"patient{pid:03d} is missing from the diagnosis split CSV")
+    expected_label = split_map[pid]["label"]
+    actual_label = "RV" if str(label).upper().strip() == "ARV" else str(label).upper().strip()
+    if actual_label != expected_label:
+        raise ValueError(
+            f"Diagnosis label mismatch for patient{pid:03d}: "
+            f"dataset={actual_label}, split_csv={expected_label}"
+        )
+    return split_map[pid]["split"]
 
 
 def patient_id_from_name(name: str) -> int:

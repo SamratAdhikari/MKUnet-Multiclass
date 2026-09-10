@@ -10,27 +10,30 @@ from tqdm import tqdm
 try:
     from .common import (
         compute_cardiac_features,
+        diagnosis_split_for,
         discover_patient_dirs,
         find_frame_path,
+        load_diagnosis_split,
         load_nifti,
         metadata_for_patient,
         patient_id_from_name,
-        split_for,
     )
 except ImportError:
     from common import (
         compute_cardiac_features,
+        diagnosis_split_for,
         discover_patient_dirs,
         find_frame_path,
+        load_diagnosis_split,
         load_nifti,
         metadata_for_patient,
         patient_id_from_name,
-        split_for,
     )
 
 
 def main(opt):
     data_root = Path(opt.data_root)
+    split_map = load_diagnosis_split(Path(opt.split_csv))
     patient_dirs = discover_patient_dirs(data_root)
     if not patient_dirs:
         raise RuntimeError(f"No patientXXX directories found under {data_root}")
@@ -43,6 +46,7 @@ def main(opt):
             continue
         try:
             meta = metadata_for_patient(patient_dir)
+            split = diagnosis_split_for(pid, meta["label"], split_map)
             ed_gt = find_frame_path(patient_dir, pid, meta["ed_frame"], gt=True)
             es_gt = find_frame_path(patient_dir, pid, meta["es_frame"], gt=True)
             ed_mask, ed_zooms, _ = load_nifti(ed_gt, dtype=np.uint8)
@@ -55,7 +59,7 @@ def main(opt):
             rows.append({
                 "patient_id": pid,
                 "patient": f"patient{pid:03d}",
-                "split": split_for(pid, opt.train_end, opt.val_end),
+                "split": split,
                 "label": meta["label"],
                 "ed_frame": meta["ed_frame"],
                 "es_frame": meta["es_frame"],
@@ -73,7 +77,7 @@ def main(opt):
     df.to_csv(out, index=False)
 
     print(f"Saved {len(df)} patient rows to {out}")
-    print(df.groupby(["split", "label"]).size().unstack(fill_value=0))
+    print(pd.crosstab(df["split"], df["label"]))
     if failures:
         print(f"\nSkipped {len(failures)} patients:")
         for pid, msg in failures[:20]:
@@ -83,9 +87,8 @@ def main(opt):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Extract ACDC diagnosis features from ground-truth masks.")
     p.add_argument("--data_root", required=True, help="Root containing patientXXX folders from the Kaggle ACDC dataset")
+    p.add_argument("--split_csv", required=True, help="CSV created once by create_diagnosis_split.py")
     p.add_argument("--output", default="./diagnosis/results/gt_features.csv")
-    p.add_argument("--train_end", type=int, default=80)
-    p.add_argument("--val_end", type=int, default=100)
     p.add_argument("--max_patient", type=int, default=150)
     p.add_argument("--strict", action="store_true")
     main(p.parse_args())

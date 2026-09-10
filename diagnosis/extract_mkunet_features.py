@@ -28,7 +28,8 @@ try:
         load_nifti,
         metadata_for_patient,
         patient_id_from_name,
-        split_for,
+        diagnosis_split_for,
+        load_diagnosis_split,
     )
 except ImportError:
     from common import (
@@ -40,7 +41,8 @@ except ImportError:
         load_nifti,
         metadata_for_patient,
         patient_id_from_name,
-        split_for,
+        diagnosis_split_for,
+        load_diagnosis_split,
     )
 
 
@@ -126,6 +128,8 @@ def main(opt):
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
+    split_map = load_diagnosis_split(Path(opt.split_csv))
+
     device = torch.device("cuda" if torch.cuda.is_available() and not opt.cpu else "cpu")
     print("Device:", device)
     model = build_model(opt.network, device)
@@ -146,6 +150,7 @@ def main(opt):
             continue
         try:
             meta = metadata_for_patient(patient_dir)
+            split = diagnosis_split_for(pid, meta["label"], split_map)
             ed_img_path = find_frame_path(patient_dir, pid, meta["ed_frame"], gt=False)
             es_img_path = find_frame_path(patient_dir, pid, meta["es_frame"], gt=False)
 
@@ -161,7 +166,7 @@ def main(opt):
             row = {
                 "patient_id": pid,
                 "patient": f"patient{pid:03d}",
-                "split": split_for(pid, opt.train_end, opt.val_end),
+                "split": split,
                 "label": meta["label"],
                 "ed_frame": meta["ed_frame"],
                 "es_frame": meta["es_frame"],
@@ -219,11 +224,10 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--network", default="MK_UNet", choices=["MK_UNet_T", "MK_UNet_S", "MK_UNet", "MK_UNet_M", "MK_UNet_L"])
     p.add_argument("--output", default="./diagnosis/results/mkunet_features.csv")
+    p.add_argument("--split_csv", required=True, help="CSV created once by create_diagnosis_split.py")
     p.add_argument("--save_masks_dir", default="")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--train_end", type=int, default=80)
-    p.add_argument("--val_end", type=int, default=100)
     p.add_argument("--max_patient", type=int, default=150)
     p.add_argument("--with_gt_metrics", action="store_true")
     p.add_argument("--cpu", action="store_true")

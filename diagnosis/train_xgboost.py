@@ -95,6 +95,27 @@ def main(opt):
             f"Need non-empty train and test rows; counts={df['split'].value_counts().to_dict()}"
         )
 
+    # This project is explicitly a five-class ACDC diagnosis experiment.  Fail
+    # fast if a bad patient split removes a diagnosis category from training.
+    missing_train_labels = sorted(set(LABELS) - set(train_df["label"]))
+    if missing_train_labels:
+        raise RuntimeError(
+            f"Training split is missing ACDC diagnosis classes: {missing_train_labels}. "
+            "Regenerate diagnosis_split.csv with create_diagnosis_split.py."
+        )
+    if not val_df.empty:
+        missing_val_labels = sorted(set(LABELS) - set(val_df["label"]))
+        if missing_val_labels:
+            raise RuntimeError(
+                f"Validation split is missing ACDC diagnosis classes: {missing_val_labels}. "
+                "Regenerate diagnosis_split.csv with create_diagnosis_split.py."
+            )
+    missing_test_labels = sorted(set(LABELS) - set(test_df["label"]))
+    if missing_test_labels:
+        raise RuntimeError(
+            f"Test split is missing ACDC diagnosis classes: {missing_test_labels}."
+        )
+
     # XGBoost's sklearn API requires the labels used for fitting to be contiguous
     # 0..K-1.  A patient-ID split can occasionally omit one of the five ACDC
     # groups from the training subset, so map the *present* global ACDC class IDs
