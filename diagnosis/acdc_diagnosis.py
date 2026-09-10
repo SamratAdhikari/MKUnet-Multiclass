@@ -414,16 +414,22 @@ def extract_mkunet_features(
 
 
 def _make_xgb(seed: int) -> XGBClassifier:
+    # Applying strict regularization to prevent 100% training accuracy memorization.
+    # NOTE: reg_alpha is intentionally lower than the previous config (1.0 -> 0.1)
+    # at the user's request. Dropping n_estimators 100 -> 60 is the change most
+    # likely to reduce train-set memorization on ~80-sample folds; if the CV train
+    # accuracy is still pinned at 1.0 after this, raising reg_alpha/reg_lambda or
+    # adding min_child_weight will do more than n_estimators/learning_rate alone.
     return XGBClassifier(
         objective="multi:softprob",
         num_class=len(LABELS),
-        n_estimators=100,
-        max_depth=3,
+        n_estimators=60,
+        max_depth=3,            # shallow trees to avoid overfitting small sample sizes
         learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
+        subsample=0.8,           # row sampling
+        colsample_bytree=0.8,    # feature sampling
+        reg_alpha=0.1,           # L1 regularization
+        reg_lambda=1.0,          # L2 regularization
         random_state=seed,
         eval_metric="mlogloss",
         n_jobs=-1,
@@ -457,6 +463,54 @@ def _plot_importance(model, columns: list[str], output_png: Path, top_n: int = 1
     fig.tight_layout()
     fig.savefig(output_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def _plot_shap(model, X, feature_columns: list[str], output_dir: Path, prefix: str, max_display: int = 15):
+    """SHAP interpretability for the final multiclass XGBoost model.
+
+    Saves one overall mean(|SHAP|) importance chart (averaged across classes)
+    plus one per-class beeswarm summary plot. `X` should already be imputed
+    (e.g. the same array passed to model.predict/predict_proba).
+    """
+    import shap
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    X_df = pd.DataFrame(np.asarray(X), columns=feature_columns)
+
+    explainer = shap.TreeExplainer(model)
+    raw_shap = explainer.shap_values(X_df)
+
+    # Older shap versions return a list of per-class (n_samples, n_features) arrays;
+    # newer versions return one (n_samples, n_features, n_classes) array. Normalize.
+    if isinstance(raw_shap, list):
+        shap_per_class = raw_shap
+    elif np.asarray(raw_shap).ndim == 3:
+        shap_per_class = [raw_shap[:, :, c] for c in range(raw_shap.shape[2])]
+    else:
+        shap_per_class = [raw_shap]
+
+    # Overall importance: mean |SHAP| averaged across all classes.
+    mean_abs = np.mean([np.abs(sv).mean(axis=0) for sv in shap_per_class], axis=0)
+    overall = pd.Series(mean_abs, index=feature_columns).sort_values().tail(max_display)
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    overall.plot(kind="barh", ax=ax)
+    ax.set_title(f"SHAP feature importance — mean |SHAP| across classes ({prefix})")
+    ax.set_xlabel("Mean |SHAP value|")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"shap_importance_overall_{prefix}.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    # Per-class beeswarm summary (saved for the export bundle / closer inspection).
+    for label, sv in zip(LABELS, shap_per_class):
+        plt.figure()
+        shap.summary_plot(sv, X_df, max_display=max_display, show=False)
+        plt.title(f"SHAP summary — {label} ({prefix})")
+        plt.tight_layout()
+        plt.savefig(output_dir / f"shap_summary_{label}_{prefix}.png", dpi=180, bbox_inches="tight")
+        plt.close()
+
+    return overall
 
 
 def _metric_dict(y_true, y_pred) -> dict:
@@ -605,6 +659,11 @@ def cross_validate_and_train(
         "Independent test confusion"
     )
     _plot_importance(final_model, feature_columns, output_dir / "feature_importance.png")
+
+    try:
+        _plot_shap(final_model, X_test, feature_columns, output_dir, prefix="test")
+    except ImportError:
+        print("shap is not installed (pip install shap) — skipping SHAP analysis.")
 
     metrics = {
         "cv": cv_summary,
