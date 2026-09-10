@@ -1,18 +1,17 @@
-# Minimal ACDC Diagnosis Module
+# Minimal ACDC Diagnosis Module — 5-Fold CV + Independent Test
 
-This folder contains one implementation file: `acdc_diagnosis.py`.
+This folder supports three ACDC diagnosis experiments:
 
-It supports three patient-level diagnosis experiments on ACDC:
+1. **GT masks → biomarkers → XGBoost** — uses the ACDC expert segmentation masks.
+2. **Raw ED/ES MRI → XGBoost** — no segmentation masks and no MK-UNet.
+3. **MRI → MK-UNet → predicted masks → biomarkers → XGBoost** — no ACDC expert segmentation masks are used for diagnosis feature extraction or inference.
 
-1. **GT masks → cardiac biomarkers → XGBoost**  
-   Uses the provided ACDC expert segmentation masks. This is the upper-bound/reference experiment.
+All XGBoost models use the ACDC `Group` field as the supervised diagnosis target.
 
-2. **Raw MRI → simple MRI features → XGBoost**  
-   Uses no ground-truth segmentation masks and no MK-UNet. This is the mask-free XGBoost-only baseline.
+## Evaluation design
 
-3. **MRI → MK-UNet predicted masks → cardiac biomarkers → XGBoost**  
-   Uses no ground-truth segmentation masks during diagnosis feature extraction or inference. MK-UNet itself was previously trained using segmentation ground truth.
+- **Patients 001–100:** development cohort used for 5-fold stratified cross-validation.
+- **Patients 101–150:** untouched independent final test cohort.
+- After CV reporting, a final XGBoost model is trained on all 100 development patients and evaluated once on patients 101–150.
 
-All XGBoost experiments still use the ACDC `Group` field (`NOR`, `MINF`, `DCM`, `HCM`, `RV`) as the supervised diagnosis target during training.
-
-The development cohort (patients 1–100) is stratified into 80 train / 20 validation patients, and patients 101–150 remain the final test cohort.
+The disease label is read directly from each patient's `Info.cfg`; it is not inferred from patient number.

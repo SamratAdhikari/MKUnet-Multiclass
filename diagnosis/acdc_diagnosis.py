@@ -19,7 +19,7 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 
 LABELS = ["NOR", "MINF", "DCM", "HCM", "RV"]
@@ -27,22 +27,8 @@ LABEL_TO_ID = {label: i for i, label in enumerate(LABELS)}
 ID_TO_LABEL = {i: label for label, i in LABEL_TO_ID.items()}
 CLASS_IDS = {"RV": 1, "MYO": 2, "LV": 3}
 
-CARDIAC_FEATURES = [
-    "height_cm", "weight_kg", "bsa_m2",
-    "lv_edv_ml", "lv_esv_ml", "lv_sv_ml", "lv_ef_pct",
-    "rv_edv_ml", "rv_esv_ml", "rv_sv_ml", "rv_ef_pct",
-    "myo_edv_ml", "myo_esv_ml", "myo_mass_g",
-    "lv_edvi_ml_m2", "lv_esvi_ml_m2",
-    "rv_edvi_ml_m2", "rv_esvi_ml_m2",
-    "myo_mass_g_m2", "lv_rv_edv_ratio", "myo_lv_ed_ratio",
-    "lv_slice_contraction_mean", "lv_slice_contraction_std",
-    "lv_slice_contraction_min", "lv_slice_contraction_max",
-    "rv_slice_contraction_mean", "rv_slice_contraction_std",
-]
-
 META_COLUMNS = {
-    "patient_id", "patient", "split", "label", "ed_frame", "es_frame",
-    "feature_source",
+    "patient_id", "patient", "cohort", "label", "ed_frame", "es_frame", "feature_source"
 }
 
 
@@ -81,11 +67,37 @@ def patient_metadata(patient_dir: Path) -> dict:
     }
 
 
+def create_cohort_file(data_root: Path, output_csv: Path) -> pd.DataFrame:
+    """Patients 1-100 are development; 101-150 are the untouched final test cohort."""
+    rows = []
+    for patient_dir in discover_patient_dirs(data_root):
+        pid = patient_id_from_name(patient_dir.name)
+        meta = patient_metadata(patient_dir)
+        rows.append({
+            "patient_id": pid,
+            "patient": f"patient{pid:03d}",
+            "cohort": "development" if pid <= 100 else "test",
+            "label": meta["label"],
+        })
+    df = pd.DataFrame(rows).sort_values("patient_id").reset_index(drop=True)
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    return df
+
+
+def _cohort_map(cohort_csv: Path) -> dict[int, str]:
+    df = pd.read_csv(cohort_csv)
+    return dict(zip(df.patient_id.astype(int), df.cohort.astype(str)))
+
+
 def _resolve_nii(path: Path) -> Path:
     if path.is_file():
         return path
     if path.is_dir():
-        return next(p for p in path.rglob("*") if p.is_file() and (p.name.endswith(".nii") or p.name.endswith(".nii.gz")))
+        return next(
+            p for p in path.rglob("*")
+            if p.is_file() and (p.name.endswith(".nii") or p.name.endswith(".nii.gz"))
+        )
     raise FileNotFoundError(path)
 
 
@@ -110,7 +122,7 @@ def load_nifti(path: Path, dtype=np.float32):
     nii = nib.load(str(path))
     array = np.asarray(nii.get_fdata(), dtype=dtype)
     zooms = tuple(float(v) for v in nii.header.get_zooms()[:3])
-    return array, zooms, nii
+    return array, zooms
 
 
 def bsa_mosteller(height_cm: float, weight_kg: float) -> float:
@@ -127,39 +139,6 @@ def normalize_volume(volume: np.ndarray) -> np.ndarray:
         return np.zeros_like(volume, dtype=np.float32)
     volume = np.clip(volume, low, high)
     return ((volume - low) / (high - low)).astype(np.float32)
-
-
-def create_split(data_root: Path, output_csv: Path, seed: int = 7) -> pd.DataFrame:
-    rows = []
-    for patient_dir in discover_patient_dirs(data_root):
-        pid = patient_id_from_name(patient_dir.name)
-        meta = patient_metadata(patient_dir)
-        rows.append({"patient_id": pid, "patient": f"patient{pid:03d}", "label": meta["label"]})
-
-    df = pd.DataFrame(rows).sort_values("patient_id").reset_index(drop=True)
-    development = df[df.patient_id <= 100].copy()
-    test = df[df.patient_id > 100].copy()
-
-    train, val = train_test_split(
-        development,
-        test_size=0.20,
-        random_state=seed,
-        stratify=development["label"],
-    )
-    train["split"] = "train"
-    val["split"] = "val"
-    test["split"] = "test"
-
-    split_df = pd.concat([train, val, test], ignore_index=True)
-    split_df = split_df[["patient_id", "patient", "split", "label"]].sort_values("patient_id")
-    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
-    split_df.to_csv(output_csv, index=False)
-    return split_df
-
-
-def _split_map(split_csv: Path) -> dict[int, str]:
-    df = pd.read_csv(split_csv)
-    return dict(zip(df.patient_id.astype(int), df.split.astype(str)))
 
 
 def _volume_ml(mask: np.ndarray, class_id: int, zooms) -> float:
@@ -190,65 +169,52 @@ def _slice_contraction(ed: np.ndarray, es: np.ndarray, class_id: int) -> dict[st
 
 
 def cardiac_features(ed_mask, es_mask, ed_zooms, es_zooms, height_cm, weight_kg) -> dict:
+    """Compact, clinically interpretable biomarker set."""
     lv_edv = _volume_ml(ed_mask, CLASS_IDS["LV"], ed_zooms)
     lv_esv = _volume_ml(es_mask, CLASS_IDS["LV"], es_zooms)
     rv_edv = _volume_ml(ed_mask, CLASS_IDS["RV"], ed_zooms)
     rv_esv = _volume_ml(es_mask, CLASS_IDS["RV"], es_zooms)
     myo_edv = _volume_ml(ed_mask, CLASS_IDS["MYO"], ed_zooms)
-    myo_esv = _volume_ml(es_mask, CLASS_IDS["MYO"], es_zooms)
 
     lv_sv = lv_edv - lv_esv
     rv_sv = rv_edv - rv_esv
     lv_ef = 100.0 * _ratio(lv_sv, lv_edv)
     rv_ef = 100.0 * _ratio(rv_sv, rv_edv)
-    bsa = bsa_mosteller(height_cm, weight_kg)
     myo_mass = myo_edv * 1.05
+    bsa = bsa_mosteller(height_cm, weight_kg)
     lv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["LV"])
-    rv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["RV"])
 
     return {
-        "height_cm": height_cm,
-        "weight_kg": weight_kg,
         "bsa_m2": bsa,
         "lv_edv_ml": lv_edv,
         "lv_esv_ml": lv_esv,
-        "lv_sv_ml": lv_sv,
         "lv_ef_pct": lv_ef,
         "rv_edv_ml": rv_edv,
         "rv_esv_ml": rv_esv,
-        "rv_sv_ml": rv_sv,
         "rv_ef_pct": rv_ef,
-        "myo_edv_ml": myo_edv,
-        "myo_esv_ml": myo_esv,
         "myo_mass_g": myo_mass,
-        "lv_edvi_ml_m2": _ratio(lv_edv, bsa),
-        "lv_esvi_ml_m2": _ratio(lv_esv, bsa),
-        "rv_edvi_ml_m2": _ratio(rv_edv, bsa),
-        "rv_esvi_ml_m2": _ratio(rv_esv, bsa),
-        "myo_mass_g_m2": _ratio(myo_mass, bsa),
         "lv_rv_edv_ratio": _ratio(lv_edv, rv_edv),
         "myo_lv_ed_ratio": _ratio(myo_edv, lv_edv),
         "lv_slice_contraction_mean": lv_con["mean"],
         "lv_slice_contraction_std": lv_con["std"],
         "lv_slice_contraction_min": lv_con["min"],
         "lv_slice_contraction_max": lv_con["max"],
-        "rv_slice_contraction_mean": rv_con["mean"],
-        "rv_slice_contraction_std": rv_con["std"],
     }
 
 
-def extract_gt_mask_features(data_root: Path, split_csv: Path, output_csv: Path) -> pd.DataFrame:
-    split_map = _split_map(split_csv)
+def extract_gt_mask_features(data_root: Path, cohort_csv: Path, output_csv: Path) -> pd.DataFrame:
+    """Experiment 1: expert ACDC segmentation masks -> biomarkers."""
+    cohort_map = _cohort_map(cohort_csv)
     rows = []
     for patient_dir in discover_patient_dirs(data_root):
         pid = patient_id_from_name(patient_dir.name)
         meta = patient_metadata(patient_dir)
-        ed, ed_zooms, _ = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=True), np.uint8)
-        es, es_zooms, _ = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=True), np.uint8)
+        ed, ed_zooms = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=True), np.uint8)
+        es, es_zooms = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=True), np.uint8)
         rows.append({
             "patient_id": pid,
             "patient": f"patient{pid:03d}",
-            "split": split_map[pid],
+            "cohort": cohort_map[pid],
             "label": meta["label"],
             "feature_source": "ground_truth_masks",
             **cardiac_features(ed, es, ed_zooms, es_zooms, meta["height_cm"], meta["weight_kg"]),
@@ -289,33 +255,26 @@ def _raw_phase_features(volume: np.ndarray, prefix: str) -> dict[str, float]:
     return features
 
 
-def extract_raw_mri_features(data_root: Path, split_csv: Path, output_csv: Path) -> pd.DataFrame:
-    """Mask-free XGBoost baseline: raw ED/ES MRI summary features + height/weight/BSA.
-
-    No ground-truth segmentation mask and no MK-UNet prediction is used here.
-    The ACDC Group field remains the supervised diagnosis target, not an input feature.
-    """
-    split_map = _split_map(split_csv)
+def extract_raw_mri_features(data_root: Path, cohort_csv: Path, output_csv: Path) -> pd.DataFrame:
+    """Experiment 2: raw ED/ES MRI summary features -> XGBoost. No segmentation masks."""
+    cohort_map = _cohort_map(cohort_csv)
     rows = []
     for patient_dir in discover_patient_dirs(data_root):
         pid = patient_id_from_name(patient_dir.name)
         meta = patient_metadata(patient_dir)
-        ed, _, _ = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=False), np.float32)
-        es, _, _ = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=False), np.float32)
-        ed_features = _raw_phase_features(ed, "ed")
-        es_features = _raw_phase_features(es, "es")
-        bsa = bsa_mosteller(meta["height_cm"], meta["weight_kg"])
+        ed, _ = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=False), np.float32)
+        es, _ = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=False), np.float32)
         rows.append({
             "patient_id": pid,
             "patient": f"patient{pid:03d}",
-            "split": split_map[pid],
+            "cohort": cohort_map[pid],
             "label": meta["label"],
             "feature_source": "raw_mri_no_masks",
             "height_cm": meta["height_cm"],
             "weight_kg": meta["weight_kg"],
-            "bsa_m2": bsa,
-            **ed_features,
-            **es_features,
+            "bsa_m2": bsa_mosteller(meta["height_cm"], meta["weight_kg"]),
+            **_raw_phase_features(ed, "ed"),
+            **_raw_phase_features(es, "es"),
         })
     df = pd.DataFrame(rows).sort_values("patient_id")
     Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -355,6 +314,7 @@ def build_mkunet(repo_dir: Path, checkpoint: Path, network: str = "MK_UNet"):
 def predict_volume(model, volume: np.ndarray, img_size: int, batch_size: int, device) -> np.ndarray:
     import torch
     import torch.nn.functional as F
+
     volume = normalize_volume(volume)
     h, w, z = volume.shape
     slices = torch.from_numpy(np.moveaxis(volume, 2, 0)[:, None]).float()
@@ -388,7 +348,7 @@ def _save_prediction_example(image: np.ndarray, mask: np.ndarray, output_png: Pa
 
 def extract_mkunet_features(
     data_root: Path,
-    split_csv: Path,
+    cohort_csv: Path,
     output_csv: Path,
     repo_dir: Path,
     checkpoint: Path,
@@ -397,11 +357,8 @@ def extract_mkunet_features(
     img_size: int = 224,
     batch_size: int = 8,
 ) -> pd.DataFrame:
-    """MRI -> MK-UNet predicted masks -> cardiac biomarkers.
-
-    Ground-truth segmentation masks are never opened by this function.
-    """
-    split_map = _split_map(split_csv)
+    """Experiment 3: MRI -> MK-UNet predicted masks -> biomarkers. No GT masks are opened."""
+    cohort_map = _cohort_map(cohort_csv)
     model, device = build_mkunet(repo_dir, checkpoint, network)
     rows = []
     example_saved = False
@@ -409,29 +366,48 @@ def extract_mkunet_features(
     for patient_dir in discover_patient_dirs(data_root):
         pid = patient_id_from_name(patient_dir.name)
         meta = patient_metadata(patient_dir)
-        ed_img, ed_zooms, _ = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=False), np.float32)
-        es_img, es_zooms, _ = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=False), np.float32)
+        ed_img, ed_zooms = load_nifti(frame_path(patient_dir, pid, meta["ed_frame"], gt=False), np.float32)
+        es_img, es_zooms = load_nifti(frame_path(patient_dir, pid, meta["es_frame"], gt=False), np.float32)
         ed_pred = predict_volume(model, ed_img, img_size, batch_size, device)
         es_pred = predict_volume(model, es_img, img_size, batch_size, device)
 
         rows.append({
             "patient_id": pid,
             "patient": f"patient{pid:03d}",
-            "split": split_map[pid],
+            "cohort": cohort_map[pid],
             "label": meta["label"],
             "feature_source": "mkunet_predicted_masks",
             **cardiac_features(ed_pred, es_pred, ed_zooms, es_zooms, meta["height_cm"], meta["weight_kg"]),
         })
 
-        if example_png is not None and not example_saved and split_map[pid] == "test":
+        if example_png is not None and not example_saved and cohort_map[pid] == "test":
             Path(example_png).parent.mkdir(parents=True, exist_ok=True)
-            _save_prediction_example(normalize_volume(ed_img), ed_pred, Path(example_png), f"patient{pid:03d} — ED")
+            _save_prediction_example(
+                normalize_volume(ed_img), ed_pred, Path(example_png), f"patient{pid:03d} — ED"
+            )
             example_saved = True
 
     df = pd.DataFrame(rows).sort_values("patient_id")
     Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
     return df
+
+
+def _make_xgb(seed: int) -> XGBClassifier:
+    return XGBClassifier(
+        objective="multi:softprob",
+        num_class=len(LABELS),
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=1.0,
+        reg_lambda=1.0,
+        random_state=seed,
+        eval_metric="mlogloss",
+        n_jobs=-1,
+    )
 
 
 def _plot_confusion(y_true, y_pred, output_png: Path, title: str):
@@ -456,85 +432,138 @@ def _plot_importance(model, columns: list[str], output_png: Path, top_n: int = 1
     importance = pd.Series(model.feature_importances_, index=columns).sort_values().tail(top_n)
     fig, ax = plt.subplots(figsize=(8, 5.5))
     importance.plot(kind="barh", ax=ax)
-    ax.set_title("XGBoost feature importance")
+    ax.set_title("Final XGBoost feature importance")
     ax.set_xlabel("Importance")
     fig.tight_layout()
     fig.savefig(output_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def train_xgboost(features_csv: Path, output_dir: Path, seed: int = 7) -> dict:
+def _metric_dict(y_true, y_pred) -> dict:
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
+    }
+
+
+def cross_validate_and_train(
+    features_csv: Path,
+    output_dir: Path,
+    seed: int = 7,
+    n_splits: int = 5,
+) -> dict:
+    """5-fold stratified CV on patients 1-100, then final training on all 100 and one test on 101-150."""
     df = pd.read_csv(features_csv)
     feature_columns = [c for c in df.columns if c not in META_COLUMNS]
-    train = df[df.split == "train"].copy()
+    development = df[df.cohort == "development"].copy().reset_index(drop=True)
+    test = df[df.cohort == "test"].copy().reset_index(drop=True)
+
+    y_dev = development.label.map(LABEL_TO_ID).to_numpy(dtype=int)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    fold_rows = []
+    oof_rows = []
+    oof_true = np.empty(len(development), dtype=int)
+    oof_pred = np.empty(len(development), dtype=int)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(development, y_dev), start=1):
+        fold_train = development.iloc[train_idx]
+        fold_val = development.iloc[val_idx]
+
+        imputer = SimpleImputer(strategy="median")
+        X_train = imputer.fit_transform(fold_train[feature_columns])
+        X_val = imputer.transform(fold_val[feature_columns])
+        y_train = fold_train.label.map(LABEL_TO_ID).to_numpy(dtype=int)
+        y_val = fold_val.label.map(LABEL_TO_ID).to_numpy(dtype=int)
+
+        model = _make_xgb(seed + fold)
+        model.fit(X_train, y_train)
+        pred = model.predict(X_val).astype(int)
+
+        scores = _metric_dict(y_val, pred)
+        fold_rows.append({"fold": fold, **scores})
+        oof_true[val_idx] = y_val
+        oof_pred[val_idx] = pred
+
+        for row_i, pred_i in zip(val_idx, pred):
+            row = development.iloc[row_i]
+            oof_rows.append({
+                "fold": fold,
+                "patient_id": int(row.patient_id),
+                "patient": row.patient,
+                "label": row.label,
+                "predicted_label": ID_TO_LABEL[int(pred_i)],
+            })
+
+    fold_metrics = pd.DataFrame(fold_rows)
+    cv_summary = {
+        metric: {
+            "mean": float(fold_metrics[metric].mean()),
+            "std": float(fold_metrics[metric].std(ddof=0)),
+        }
+        for metric in ["accuracy", "balanced_accuracy", "macro_f1"]
+    }
 
     imputer = SimpleImputer(strategy="median")
-    X_train = imputer.fit_transform(train[feature_columns])
-    y_train = train.label.map(LABEL_TO_ID).to_numpy(dtype=int)
+    X_dev = imputer.fit_transform(development[feature_columns])
+    X_test = imputer.transform(test[feature_columns])
+    y_test = test.label.map(LABEL_TO_ID).to_numpy(dtype=int)
 
-    model = XGBClassifier(
-        objective="multi:softprob",
-        num_class=len(LABELS),
-        n_estimators=250,
-        max_depth=3,
-        learning_rate=0.03,
-        min_child_weight=1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        eval_metric="mlogloss",
-        random_state=seed,
-        n_jobs=-1,
+    final_model = _make_xgb(seed)
+    final_model.fit(X_dev, y_dev)
+    probability = final_model.predict_proba(X_test)
+    test_pred = probability.argmax(axis=1)
+
+    test_report = classification_report(
+        y_test,
+        test_pred,
+        labels=list(range(len(LABELS))),
+        target_names=LABELS,
+        output_dict=True,
+        zero_division=0,
     )
-    model.fit(X_train, y_train)
+    test_metrics = {
+        **_metric_dict(y_test, test_pred),
+        "classification_report": test_report,
+    }
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_metrics.to_csv(output_dir / "cv_fold_metrics.csv", index=False)
+    pd.DataFrame(oof_rows).sort_values("patient_id").to_csv(output_dir / "cv_predictions.csv", index=False)
+
+    test_predictions = test[["patient_id", "patient", "cohort", "label"]].copy()
+    test_predictions["predicted_label"] = [ID_TO_LABEL[int(i)] for i in test_pred]
+    test_predictions["correct"] = test_predictions.label == test_predictions.predicted_label
+    for i, label in enumerate(LABELS):
+        test_predictions[f"prob_{label}"] = probability[:, i]
+    test_predictions.to_csv(output_dir / "predictions_test.csv", index=False)
+
     joblib.dump(
-        {"model": model, "imputer": imputer, "feature_columns": feature_columns},
+        {
+            "model": final_model,
+            "imputer": imputer,
+            "feature_columns": feature_columns,
+            "labels": LABELS,
+        },
         output_dir / "model.joblib",
     )
 
-    all_metrics = {}
-    for split_name in ["train", "val", "test"]:
-        part = df[df.split == split_name].copy()
-        X = imputer.transform(part[feature_columns])
-        y_true = part.label.map(LABEL_TO_ID).to_numpy(dtype=int)
-        probability = model.predict_proba(X)
-        y_pred = probability.argmax(axis=1)
+    _plot_confusion(oof_true, oof_pred, output_dir / "confusion_cv_oof.png", "5-fold CV out-of-fold confusion")
+    _plot_confusion(y_test, test_pred, output_dir / "confusion_test.png", "Independent test confusion")
+    _plot_importance(final_model, feature_columns, output_dir / "feature_importance.png")
 
-        report = classification_report(
-            y_true,
-            y_pred,
-            labels=list(range(len(LABELS))),
-            target_names=LABELS,
-            output_dict=True,
-            zero_division=0,
-        )
-        all_metrics[split_name] = {
-            "accuracy": float(accuracy_score(y_true, y_pred)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-            "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
-            "classification_report": report,
-        }
-
-        prediction = part[["patient_id", "patient", "split", "label"]].copy()
-        prediction["predicted_label"] = [ID_TO_LABEL[i] for i in y_pred]
-        prediction["correct"] = prediction.label == prediction.predicted_label
-        for i, label in enumerate(LABELS):
-            prediction[f"prob_{label}"] = probability[:, i]
-        prediction.to_csv(output_dir / f"predictions_{split_name}.csv", index=False)
-
-        _plot_confusion(
-            y_true,
-            y_pred,
-            output_dir / f"confusion_{split_name}.png",
-            f"{split_name.title()} confusion matrix",
-        )
-
-    _plot_importance(model, feature_columns, output_dir / "feature_importance.png")
-    (output_dir / "metrics.json").write_text(json.dumps(all_metrics, indent=2))
-    return all_metrics
+    metrics = {
+        "cv": cv_summary,
+        "test": test_metrics,
+        "n_development": int(len(development)),
+        "n_test": int(len(test)),
+        "n_splits": int(n_splits),
+    }
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    return metrics
 
 
 def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Path):
@@ -544,14 +573,17 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     rows = []
     f1_rows = []
     for name, (metrics, _) in experiments.items():
-        test = metrics["test"]
         rows.append({
             "Pipeline": name,
-            "Accuracy": test["accuracy"],
-            "Balanced Accuracy": test["balanced_accuracy"],
-            "Macro F1": test["macro_f1"],
+            "CV Accuracy Mean": metrics["cv"]["accuracy"]["mean"],
+            "CV Accuracy Std": metrics["cv"]["accuracy"]["std"],
+            "CV Macro F1 Mean": metrics["cv"]["macro_f1"]["mean"],
+            "CV Macro F1 Std": metrics["cv"]["macro_f1"]["std"],
+            "Test Accuracy": metrics["test"]["accuracy"],
+            "Test Balanced Accuracy": metrics["test"]["balanced_accuracy"],
+            "Test Macro F1": metrics["test"]["macro_f1"],
         })
-        report = test["classification_report"]
+        report = metrics["test"]["classification_report"]
         for label in LABELS:
             f1_rows.append({"Pipeline": name, "Class": label, "F1": report[label]["f1-score"]})
 
@@ -560,21 +592,38 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     comparison.to_csv(output_dir / "pipeline_comparison.csv", index=False)
     per_class.to_csv(output_dir / "per_class_f1.csv", index=False)
 
-    ax = comparison.set_index("Pipeline")[["Accuracy", "Balanced Accuracy", "Macro F1"]].plot(
-        kind="bar", figsize=(10, 5.5), rot=15
-    )
+    ax = comparison.set_index("Pipeline")[[
+        "Test Accuracy", "Test Balanced Accuracy", "Test Macro F1"
+    ]].plot(kind="bar", figsize=(10, 5.5), rot=15)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Score")
-    ax.set_title("ACDC diagnosis pipeline comparison")
+    ax.set_title("Independent test-set comparison")
     plt.tight_layout()
-    plt.savefig(output_dir / "pipeline_comparison.png", dpi=180, bbox_inches="tight")
+    plt.savefig(output_dir / "test_pipeline_comparison.png", dpi=180, bbox_inches="tight")
     plt.close()
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(comparison))
+    ax.errorbar(
+        x,
+        comparison["CV Macro F1 Mean"],
+        yerr=comparison["CV Macro F1 Std"],
+        fmt="o",
+        capsize=5,
+    )
+    ax.set_xticks(x, comparison["Pipeline"], rotation=15, ha="right")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Macro F1")
+    ax.set_title("5-fold CV Macro-F1: mean ± standard deviation")
+    fig.tight_layout()
+    fig.savefig(output_dir / "cv_macro_f1_comparison.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
     pivot = per_class.pivot(index="Class", columns="Pipeline", values="F1").reindex(LABELS)
     ax = pivot.plot(kind="bar", figsize=(10, 5.5), rot=0)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("F1 score")
-    ax.set_title("Per-class F1 comparison")
+    ax.set_title("Independent test per-class F1")
     plt.tight_layout()
     plt.savefig(output_dir / "per_class_f1.png", dpi=180, bbox_inches="tight")
     plt.close()
@@ -587,6 +636,7 @@ def export_bundle(
     diagnosis_dir: Path,
     checkpoint: Path,
     output_zip_base: Path,
+    notebook_path: Path | None = None,
 ) -> Path:
     export_dir = Path(str(output_zip_base) + "_folder")
     if export_dir.exists():
@@ -596,11 +646,16 @@ def export_bundle(
     (export_dir / "code").mkdir(parents=True)
 
     shutil.copytree(results_dir, export_dir / "results", dirs_exist_ok=True)
-    shutil.copy2(diagnosis_dir / "acdc_diagnosis.py", export_dir / "code" / "acdc_diagnosis.py")
-    shutil.copy2(checkpoint, export_dir / "models" / checkpoint.name)
+    for filename in ["acdc_diagnosis.py", "README.md", "requirements.txt"]:
+        source = diagnosis_dir / filename
+        if source.exists():
+            shutil.copy2(source, export_dir / "code" / filename)
 
+    if notebook_path is not None and Path(notebook_path).exists():
+        shutil.copy2(notebook_path, export_dir / Path(notebook_path).name)
+
+    shutil.copy2(checkpoint, export_dir / "models" / checkpoint.name)
     for model in Path(results_dir).rglob("model.joblib"):
         shutil.copy2(model, export_dir / "models" / f"{model.parent.name}.joblib")
 
-    zip_file = shutil.make_archive(str(output_zip_base), "zip", export_dir)
-    return Path(zip_file)
+    return Path(shutil.make_archive(str(output_zip_base), "zip", export_dir))
