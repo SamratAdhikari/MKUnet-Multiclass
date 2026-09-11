@@ -12,14 +12,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     classification_report,
+    cohen_kappa_score,
     confusion_matrix,
     f1_score,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 LABELS = ["NOR", "MINF", "DCM", "HCM", "RV"]
@@ -168,6 +172,115 @@ def _slice_contraction(ed: np.ndarray, es: np.ndarray, class_id: int) -> dict[st
     }
 
 
+def _segment_wall_thickness(
+    mask: np.ndarray,
+    zooms,
+    n_sectors: int = 6,
+    n_thirds: int = 3,
+    ray_step: float = 0.5,
+) -> dict[tuple[int, int], float]:
+    """Myocardial wall thickness (mm) per (basal/mid/apical third, angular sector).
+
+    For every short-axis slice that contains both LV cavity and myocardium, cast
+    `n_sectors` rays outward from the LV centroid and measure how far each ray
+    travels through MYO-labeled voxels. Slices are grouped into `n_thirds`
+    contiguous groups (by stack position) to approximate base/mid/apex. This
+    gives a coarse 2D map of regional wall thickness rather than a single
+    global myocardial volume, which is what actually separates a regional
+    disease (MINF: some segments thin/akinetic, others normal) from a global
+    one (DCM: every segment is thin and dilated fairly uniformly).
+    """
+    lv_id, myo_id = CLASS_IDS["LV"], CLASS_IDS["MYO"]
+    pix = float(np.mean(zooms[:2]))
+    if not np.isfinite(pix) or pix <= 0:
+        pix = 1.0
+
+    valid_slices = [
+        z for z in range(mask.shape[2])
+        if np.count_nonzero(mask[:, :, z] == lv_id) >= 5
+        and np.count_nonzero(mask[:, :, z] == myo_id) >= 5
+    ]
+    if not valid_slices:
+        return {}
+
+    thirds = np.array_split(valid_slices, min(n_thirds, len(valid_slices)))
+    angles = np.linspace(0, 2 * np.pi, n_sectors, endpoint=False)
+    max_r = float(max(mask.shape[0], mask.shape[1]))
+    steps = np.arange(0.0, max_r, ray_step)
+
+    samples: dict[tuple[int, int], list[float]] = {}
+    for third_idx, zs in enumerate(thirds):
+        for z in zs:
+            sl = mask[:, :, int(z)]
+            ys, xs = np.nonzero(sl == lv_id)
+            if len(xs) == 0:
+                continue
+            cx, cy = float(xs.mean()), float(ys.mean())
+            h, w = sl.shape
+            for sector_idx, angle in enumerate(angles):
+                dx, dy = math.cos(angle), math.sin(angle)
+                xi = np.clip(np.round(cx + dx * steps).astype(int), 0, w - 1)
+                yi = np.clip(np.round(cy + dy * steps).astype(int), 0, h - 1)
+                vals = sl[yi, xi]
+                in_myo = vals == myo_id
+                if not in_myo.any():
+                    continue
+                # thickness = contiguous run of MYO voxels the ray first crosses
+                first_myo = int(np.argmax(in_myo))
+                run_len = 0
+                for v in in_myo[first_myo:]:
+                    if not v:
+                        break
+                    run_len += 1
+                if run_len == 0:
+                    continue
+                key = (third_idx, sector_idx)
+                samples.setdefault(key, []).append(run_len * ray_step * pix)
+
+    return {key: float(np.mean(vals)) for key, vals in samples.items()}
+
+
+def _wall_thickness_features(ed_mask, es_mask, ed_zooms, es_zooms) -> dict[str, float]:
+    """Summary regional wall-thickness/thickening biomarkers for MINF vs DCM.
+
+    - *_wt_mean / *_wt_std / *_wt_min: mean, regional heterogeneity, and
+      thinnest segment for ED/ES wall thickness. A low, near-uniform thickness
+      with low std points toward global disease (DCM); a normal mean but high
+      std / very low min points toward regional disease (MINF).
+    - thickening_*: fractional systolic wall thickening per segment,
+      (ES - ED) / ED. MINF segments over the infarct typically fail to
+      thicken (near zero or negative) while remote segments thicken
+      normally, producing high thickening_std and low thickening_min even
+      when global EF looks only moderately reduced.
+    """
+    ed_seg = _segment_wall_thickness(ed_mask, ed_zooms)
+    es_seg = _segment_wall_thickness(es_mask, es_zooms)
+    shared_keys = sorted(set(ed_seg) & set(es_seg))
+
+    def _stats(values: list[float], prefix: str) -> dict[str, float]:
+        if not values:
+            return {f"{prefix}_mean": np.nan, f"{prefix}_std": np.nan, f"{prefix}_min": np.nan}
+        arr = np.asarray(values, dtype=float)
+        return {
+            f"{prefix}_mean": float(arr.mean()),
+            f"{prefix}_std": float(arr.std()),
+            f"{prefix}_min": float(arr.min()),
+        }
+
+    out = {}
+    out.update(_stats(list(ed_seg.values()), "ed_wt"))
+    out.update(_stats(list(es_seg.values()), "es_wt"))
+
+    thickening = [
+        (es_seg[k] - ed_seg[k]) / ed_seg[k]
+        for k in shared_keys
+        if ed_seg[k] > 1e-6
+    ]
+    out.update(_stats(thickening, "thickening"))
+    out["n_wall_segments"] = float(len(shared_keys))
+    return out
+
+
 def cardiac_features(ed_mask, es_mask, ed_zooms, es_zooms, height_cm, weight_kg) -> dict:
     """Full segmentation-derived cardiac biomarker set used by Experiments 1 and 3.
 
@@ -191,6 +304,7 @@ def cardiac_features(ed_mask, es_mask, ed_zooms, es_zooms, height_cm, weight_kg)
 
     lv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["LV"])
     rv_con = _slice_contraction(ed_mask, es_mask, CLASS_IDS["RV"])
+    wall = _wall_thickness_features(ed_mask, es_mask, ed_zooms, es_zooms)
 
     return {
         "height_cm": float(height_cm),
@@ -220,6 +334,7 @@ def cardiac_features(ed_mask, es_mask, ed_zooms, es_zooms, height_cm, weight_kg)
         "lv_slice_contraction_max": lv_con["max"],
         "rv_slice_contraction_mean": rv_con["mean"],
         "rv_slice_contraction_std": rv_con["std"],
+        **wall,
     }
 
 def extract_gt_mask_features(data_root: Path, cohort_csv: Path, output_csv: Path) -> pd.DataFrame:
@@ -436,6 +551,59 @@ def _make_xgb(seed: int) -> XGBClassifier:
     )
 
 
+def make_logreg_baseline(seed: int) -> Pipeline:
+    """Linear baseline: standardize + multinomial logistic regression.
+
+    Run through the exact same protocol (imputer, 5-fold CV, held-out test)
+    as the XGBoost models. If XGBoost's improvement over this simple, low-
+    variance linear model is small, that's a sign the biomarker features are
+    carrying most of the signal and the gradient-boosted trees are adding
+    little beyond what a linear model already captures -- useful context for
+    judging whether XGBoost's apparent skill is real or partly small-sample
+    overfitting.
+    """
+    return Pipeline([
+        ("scale", StandardScaler()),
+        ("clf", LogisticRegression(
+            solver="lbfgs",
+            max_iter=5000,
+            C=1.0,
+            class_weight="balanced",
+            random_state=seed,
+        )),
+    ])
+
+
+def _bootstrap_ci(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    metric_fn,
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for a metric computed on paired (y_true, y_pred).
+
+    Resamples patients with replacement `n_boot` times and recomputes the
+    metric each time; returns the (alpha/2, 1 - alpha/2) percentiles. With
+    only 50 independent-test patients, a single point accuracy is noisy --
+    this quantifies that noise instead of implying more precision than the
+    sample size supports.
+    """
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = len(y_true)
+    if n == 0:
+        return (float("nan"), float("nan"))
+    scores = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        scores[b] = metric_fn(y_true[idx], y_pred[idx])
+    low, high = np.percentile(scores, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(low), float(high)
+
+
 def _plot_confusion(y_true, y_pred, output_png: Path, title: str):
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(LABELS))))
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
@@ -536,12 +704,32 @@ def cross_validate_and_train(
     output_dir: Path,
     seed: int = 7,
     n_splits: int = 5,
+    n_repeats: int = 1,
+    model_factory=_make_xgb,
+    model_name: str = "xgboost",
+    n_bootstrap: int = 2000,
 ) -> dict:
-    """Exact 5-fold stratified CV on patients 1-100, then final held-out testing.
+    """Stratified CV on patients 1-100, then final held-out testing.
 
     For every fold we report BOTH training and validation metrics. After CV, a
     fresh final model is fitted on all development patients (1-100), its train
     performance is recorded, and it is evaluated once on patients 101-150.
+
+    `n_repeats` controls how many times the 5-fold split is repeated with a
+    different shuffle (via RepeatedStratifiedKFold) purely to make the CV
+    mean/std estimate less noisy -- with ~80 training patients per fold, a
+    single 5-fold run has high variance in which patients land in which fold.
+    Repeating and averaging over more folds gives a more honest estimate of
+    the model's spread without touching the untouched test cohort. The
+    out-of-fold predictions used for `cv_predictions.csv` / the OOF confusion
+    matrix still come from the first repeat only, so those artifacts are
+    identical to the n_repeats=1 case.
+
+    `model_factory(seed) -> unfitted estimator` lets the same protocol be
+    reused for non-XGBoost models (e.g. a linear baseline) so pipelines are
+    directly comparable. `n_bootstrap` sets the number of bootstrap resamples
+    used for the 95% CI reported on the independent-test metrics; set to 0 to
+    skip.
     """
     df = pd.read_csv(features_csv)
     feature_columns = [c for c in df.columns if c not in META_COLUMNS]
@@ -549,14 +737,19 @@ def cross_validate_and_train(
     test = df[df.cohort == "test"].copy().reset_index(drop=True)
 
     y_dev = development.label.map(LABEL_TO_ID).to_numpy(dtype=int)
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    if n_repeats > 1:
+        splitter = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+    else:
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     fold_rows = []
     oof_rows = []
     oof_true = np.empty(len(development), dtype=int)
     oof_pred = np.empty(len(development), dtype=int)
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(development, y_dev), start=1):
+    for split_i, (train_idx, val_idx) in enumerate(splitter.split(development, y_dev)):
+        fold = split_i % n_splits + 1
+        repeat = split_i // n_splits + 1
         fold_train = development.iloc[train_idx]
         fold_val = development.iloc[val_idx]
 
@@ -566,7 +759,7 @@ def cross_validate_and_train(
         y_train = fold_train.label.map(LABEL_TO_ID).to_numpy(dtype=int)
         y_val = fold_val.label.map(LABEL_TO_ID).to_numpy(dtype=int)
 
-        model = _make_xgb(seed + fold)
+        model = model_factory(seed + split_i + 1)
         model.fit(X_train, y_train)
 
         train_pred = model.predict(X_train).astype(int)
@@ -575,27 +768,31 @@ def cross_validate_and_train(
         val_scores = _metric_dict(y_val, val_pred)
 
         fold_rows.append({
+            "repeat": repeat,
             "fold": fold,
             **{f"train_{k}": v for k, v in train_scores.items()},
             **{f"val_{k}": v for k, v in val_scores.items()},
         })
-        oof_true[val_idx] = y_val
-        oof_pred[val_idx] = val_pred
 
-        for row_i, pred_i in zip(val_idx, val_pred):
-            row = development.iloc[row_i]
-            oof_rows.append({
-                "fold": fold,
-                "patient_id": int(row.patient_id),
-                "patient": row.patient,
-                "label": row.label,
-                "predicted_label": ID_TO_LABEL[int(pred_i)],
-            })
+        if repeat == 1:
+            oof_true[val_idx] = y_val
+            oof_pred[val_idx] = val_pred
+            for row_i, pred_i in zip(val_idx, val_pred):
+                row = development.iloc[row_i]
+                oof_rows.append({
+                    "fold": fold,
+                    "patient_id": int(row.patient_id),
+                    "patient": row.patient,
+                    "label": row.label,
+                    "predicted_label": ID_TO_LABEL[int(pred_i)],
+                })
 
     fold_metrics = pd.DataFrame(fold_rows)
     cv_summary = {
         "train": _summary_from_fold_metrics(fold_metrics, "train"),
         "validation": _summary_from_fold_metrics(fold_metrics, "val"),
+        "n_repeats": int(n_repeats),
+        "n_folds_total": int(len(fold_metrics)),
     }
 
     # Final model: fit once on every development patient, then evaluate the untouched test cohort.
@@ -604,7 +801,7 @@ def cross_validate_and_train(
     X_test = final_imputer.transform(test[feature_columns])
     y_test = test.label.map(LABEL_TO_ID).to_numpy(dtype=int)
 
-    final_model = _make_xgb(seed)
+    final_model = model_factory(seed)
     final_model.fit(X_dev, y_dev)
 
     final_train_pred = final_model.predict(X_dev).astype(int)
@@ -624,6 +821,20 @@ def cross_validate_and_train(
         **_metric_dict(y_test, test_pred),
         "classification_report": test_report,
     }
+
+    if n_bootstrap and n_bootstrap > 0 and len(y_test) > 0:
+        macro_f1_fn = lambda yt, yp: f1_score(  # noqa: E731
+            yt, yp, average="macro", labels=list(range(len(LABELS))), zero_division=0
+        )
+        test_metrics["accuracy_ci95"] = list(
+            _bootstrap_ci(y_test, test_pred, accuracy_score, n_boot=n_bootstrap, seed=seed)
+        )
+        test_metrics["balanced_accuracy_ci95"] = list(
+            _bootstrap_ci(y_test, test_pred, balanced_accuracy_score, n_boot=n_bootstrap, seed=seed + 1)
+        )
+        test_metrics["macro_f1_ci95"] = list(
+            _bootstrap_ci(y_test, test_pred, macro_f1_fn, n_boot=n_bootstrap, seed=seed + 2)
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -658,20 +869,26 @@ def cross_validate_and_train(
         y_test, test_pred, output_dir / "confusion_test.png",
         "Independent test confusion"
     )
-    _plot_importance(final_model, feature_columns, output_dir / "feature_importance.png")
-
-    try:
-        _plot_shap(final_model, X_test, feature_columns, output_dir, prefix="test")
-    except ImportError:
-        print("shap is not installed (pip install shap) — skipping SHAP analysis.")
+    if hasattr(final_model, "feature_importances_"):
+        _plot_importance(final_model, feature_columns, output_dir / "feature_importance.png")
+        try:
+            _plot_shap(final_model, X_test, feature_columns, output_dir, prefix="test")
+        except ImportError:
+            print("shap is not installed (pip install shap) — skipping SHAP analysis.")
+        except Exception as exc:
+            print(f"SHAP analysis skipped for {model_name}: {exc}")
+    else:
+        print(f"Skipping feature-importance/SHAP plots: '{model_name}' has no tree feature_importances_.")
 
     metrics = {
+        "model_name": model_name,
         "cv": cv_summary,
         "final_train": final_train_metrics,
         "test": test_metrics,
         "n_development": int(len(development)),
         "n_test": int(len(test)),
         "n_splits": int(n_splits),
+        "n_repeats": int(n_repeats),
         "n_features": int(len(feature_columns)),
         "feature_columns": feature_columns,
     }
@@ -705,11 +922,20 @@ def metrics_display_table(metrics: dict) -> pd.DataFrame:
         },
         {
             "Dataset": "Independent Test — patients 101–150",
-            "Accuracy": f"{metrics['test']['accuracy']:.4f}",
-            "Balanced Accuracy": f"{metrics['test']['balanced_accuracy']:.4f}",
-            "Macro F1": f"{metrics['test']['macro_f1']:.4f}",
+            "Accuracy": _with_ci(metrics["test"], "accuracy"),
+            "Balanced Accuracy": _with_ci(metrics["test"], "balanced_accuracy"),
+            "Macro F1": _with_ci(metrics["test"], "macro_f1"),
         },
     ])
+
+
+def _with_ci(test_metrics: dict, key: str) -> str:
+    """'{value:.4f}' or '{value:.4f} [lo, hi]' when a bootstrap CI was computed."""
+    value = test_metrics[key]
+    ci = test_metrics.get(f"{key}_ci95")
+    if ci:
+        return f"{value:.4f} [{ci[0]:.4f}, {ci[1]:.4f}]"
+    return f"{value:.4f}"
 
 def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Path):
     output_dir = Path(output_dir)
@@ -718,6 +944,8 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     rows = []
     f1_rows = []
     for name, (metrics, _) in experiments.items():
+        acc_ci = metrics["test"].get("accuracy_ci95", [np.nan, np.nan])
+        f1_ci = metrics["test"].get("macro_f1_ci95", [np.nan, np.nan])
         rows.append({
             "Pipeline": name,
             "CV Train Accuracy Mean": metrics["cv"]["train"]["accuracy"]["mean"],
@@ -732,8 +960,12 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
             "Final Train Balanced Accuracy": metrics["final_train"]["balanced_accuracy"],
             "Final Train Macro F1": metrics["final_train"]["macro_f1"],
             "Test Accuracy": metrics["test"]["accuracy"],
+            "Test Accuracy CI Low": acc_ci[0],
+            "Test Accuracy CI High": acc_ci[1],
             "Test Balanced Accuracy": metrics["test"]["balanced_accuracy"],
             "Test Macro F1": metrics["test"]["macro_f1"],
+            "Test Macro F1 CI Low": f1_ci[0],
+            "Test Macro F1 CI High": f1_ci[1],
             "Number of Features": metrics["n_features"],
         })
         report = metrics["test"]["classification_report"]
@@ -755,6 +987,24 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     plt.tight_layout()
     plt.savefig(output_dir / "test_pipeline_comparison.png", dpi=180, bbox_inches="tight")
     plt.close()
+
+    # Test accuracy with bootstrap 95% CI — makes clear how much of any
+    # between-pipeline gap is distinguishable given only ~50 test patients.
+    if comparison["Test Accuracy CI Low"].notna().any():
+        fig, ax = plt.subplots(figsize=(9, 5))
+        x = np.arange(len(comparison))
+        acc = comparison["Test Accuracy"].to_numpy()
+        lo = comparison["Test Accuracy CI Low"].to_numpy()
+        hi = comparison["Test Accuracy CI High"].to_numpy()
+        yerr = np.vstack([acc - lo, hi - acc])
+        ax.errorbar(x, acc, yerr=yerr, fmt="o", capsize=5)
+        ax.set_xticks(x, comparison["Pipeline"], rotation=15, ha="right")
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Test accuracy")
+        ax.set_title("Independent-test accuracy with 95% bootstrap CI")
+        fig.tight_layout()
+        fig.savefig(output_dir / "test_accuracy_ci.png", dpi=180, bbox_inches="tight")
+        plt.close(fig)
 
     # CV train-vs-validation comparison exposes overfitting directly.
     stage = comparison.set_index("Pipeline")[[
@@ -797,6 +1047,91 @@ def comparison_tables(experiments: dict[str, tuple[dict, Path]], output_dir: Pat
     plt.close()
 
     return comparison, pivot
+
+def agreement_report(
+    pred_csv_a: Path,
+    pred_csv_b: Path,
+    name_a: str,
+    name_b: str,
+    output_dir: Path,
+) -> dict:
+    """Agreement between two pipelines' independent-test predictions.
+
+    Reuses the `predictions_test.csv` already written by `cross_validate_and_train`
+    for each pipeline (e.g. GT-mask XGBoost vs MK-UNet XGBoost). Reports:
+    - each pipeline's accuracy / Cohen's kappa against the true label
+    - raw agreement rate and Cohen's kappa *between the two pipelines directly*
+      (do the automatic and expert-derived biomarkers lead to the same
+      diagnosis, independent of whether either is "correct"?)
+    - a confusion matrix of pipeline A's predictions vs pipeline B's predictions
+
+    A high inter-pipeline kappa is direct evidence that MK-UNet segmentations
+    are an adequate substitute for expert masks in this diagnosis task -- the
+    "automatic ~= expert" claim -- and is a stronger statement than simply
+    citing two similar-looking test accuracies, since it's computed on
+    matched patients rather than aggregate summary statistics.
+    """
+    a = pd.read_csv(pred_csv_a)[["patient", "label", "predicted_label"]].rename(
+        columns={"predicted_label": "pred_a"}
+    )
+    b = pd.read_csv(pred_csv_b)[["patient", "predicted_label"]].rename(
+        columns={"predicted_label": "pred_b"}
+    )
+    merged = a.merge(b, on="patient", how="inner").sort_values("patient")
+    if len(merged) == 0:
+        raise ValueError("No overlapping patients between the two prediction files.")
+
+    y_true = merged["label"].to_numpy()
+    pred_a = merged["pred_a"].to_numpy()
+    pred_b = merged["pred_b"].to_numpy()
+
+    acc_a = float(accuracy_score(y_true, pred_a))
+    acc_b = float(accuracy_score(y_true, pred_b))
+    kappa_a_vs_truth = float(cohen_kappa_score(y_true, pred_a))
+    kappa_b_vs_truth = float(cohen_kappa_score(y_true, pred_b))
+
+    agreement_rate = float((pred_a == pred_b).mean())
+    kappa_a_vs_b = float(cohen_kappa_score(pred_a, pred_b))
+
+    cm = confusion_matrix(pred_a, pred_b, labels=LABELS)
+    cm_df = pd.DataFrame(cm, index=[f"{name_a}:{l}" for l in LABELS],
+                          columns=[f"{name_b}:{l}" for l in LABELS])
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(output_dir / "agreement_matched_predictions.csv", index=False)
+    cm_df.to_csv(output_dir / "agreement_confusion_matrix.csv")
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    image = ax.imshow(cm)
+    fig.colorbar(image, ax=ax)
+    ax.set_xticks(range(len(LABELS)), LABELS, rotation=45, ha="right")
+    ax.set_yticks(range(len(LABELS)), LABELS)
+    ax.set_xlabel(f"{name_b} predicted label")
+    ax.set_ylabel(f"{name_a} predicted label")
+    ax.set_title(f"Pipeline agreement: {name_a} vs {name_b}\n"
+                 f"(raw agreement {agreement_rate:.1%}, kappa {kappa_a_vs_b:.3f})")
+    for i in range(len(LABELS)):
+        for j in range(len(LABELS)):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+    fig.tight_layout()
+    fig.savefig(output_dir / "agreement_confusion_matrix.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    result = {
+        "n_patients": int(len(merged)),
+        "pipeline_a": name_a,
+        "pipeline_b": name_b,
+        "accuracy_a_vs_truth": acc_a,
+        "accuracy_b_vs_truth": acc_b,
+        "kappa_a_vs_truth": kappa_a_vs_truth,
+        "kappa_b_vs_truth": kappa_b_vs_truth,
+        "raw_agreement_a_vs_b": agreement_rate,
+        "kappa_a_vs_b": kappa_a_vs_b,
+    }
+    (output_dir / "agreement_report.json").write_text(json.dumps(result, indent=2))
+    return result
+
 
 def export_bundle(
     results_dir: Path,
